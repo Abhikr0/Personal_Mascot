@@ -1,0 +1,9 @@
+pydantic
+openai
+duckduckgo-search
+trafilatura
+rich
+python-dotenv
+aiohttp
+pyyaml
+pyautogui
