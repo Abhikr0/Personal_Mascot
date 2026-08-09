@@ -3,7 +3,6 @@ uvicorn
 python-multipart
 groq
 edge-tts
-soundfile
 SpeechRecognition
 python-dotenv
 pydub
