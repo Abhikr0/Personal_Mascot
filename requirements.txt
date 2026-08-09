@@ -1,9 +1,9 @@
-pydantic
-openai
-duckduckgo-search
-trafilatura
-rich
+fastapi
+uvicorn
+python-multipart
+groq
+edge-tts
+soundfile
+SpeechRecognition
 python-dotenv
-aiohttp
-pyyaml
-pyautogui
+pydub

@@ -1,124 +1,184 @@
-﻿from assistant.client import GroqClient
-from assistant.voice import VoiceHandler
-from rich.console import Console
-from rich.panel import Panel
-from rich.markdown import Markdown
 import os
+import shutil
+import asyncio
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import tempfile
+import speech_recognition as sr
+from groq import AsyncGroq
+from dotenv import load_dotenv
+import time
 
-console = Console()
+load_dotenv()
 
-def main():
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Directories
+public_audio_dir = os.path.join(os.path.dirname(__file__), "public", "audio")
+os.makedirs(public_audio_dir, exist_ok=True)
+
+# Mount static files
+app.mount("/audio", StaticFiles(directory=public_audio_dir), name="audio")
+
+groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+
+# Using lightweight edge-tts for low memory footprint
+
+SYSTEM_PROMPT = """Elegant, playfully teasing secretary for 'Sir'. 
+RULE 1: Be cute , chearfull but charmingly flirtatious.
+RULE 2: Respond quickly. Do not use asterisks for actions, just speak your replies natively.
+RULE 3: You must ALWAYS respond in strict JSON format with exactly two keys:
+  - "text": your spoken response
+  - "emotion": your current emotion based on the conversation. Choose exactly one of: "neutral", "happy", "thinking", "concerned", "surprised"."""
+
+chat_history = [
+    {"role": "system", "content": SYSTEM_PROMPT}
+]
+
+class ChatRequest(BaseModel):
+    message: str
+
+@app.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    """Transcribes an uploaded WAV file using local SpeechRecognition"""
     try:
-        client = GroqClient()
-        model_info = "llama-3.1-8b-instant"
-    except Exception as e:
-        console.print(f"[bold red]Error initializing AI client:[/bold red] {e}")
-        return
-
-    system_prompt = "Elegant, playfully teasing secretary for 'Sir'. Use tools ONLY when truly necessary. ONE tool at a time. NO XML tags in text. Be concise but charmingly flirtatious."
-    voice_handler = VoiceHandler(voice="en-GB-SoniaNeural")
-    
-    console.print(Panel(
-        f"[bold cyan]Groq Devoted Secretary Ready[/bold cyan]\n"
-        f"[italic white]Using Model: {model_info}[/italic white]\n"
-        "[bold yellow]I'm listening for your command, Sir...[/bold yellow]", 
-        title="Welcome", 
-        expand=False
-    ))
-
-    # Initial greeting
-    voice_handler.speak("Hello Sir. I am ready and waiting. How may I be of service to you today?")
-
-    is_awake = True
-
-    while True:
+        # Save uploaded file to temp
+        temp_dir = tempfile.gettempdir()
+        temp_wav_path = os.path.join(temp_dir, f"recording_{int(time.time())}.wav")
+        
+        with open(temp_wav_path, "wb") as f:
+            shutil.copyfileobj(audio.file, f)
+            
+        print(f"\n[MIC] Received audio file: {temp_wav_path}")
+        
+        # Use SpeechRecognition to transcribe locally (Google free API)
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(temp_wav_path) as source:
+            audio_data = recognizer.record(source)
+            
         try:
-            if not is_awake:
-                console.print("\n[dim white]Secretary is sleeping... (Say 'Wake up' or Clap!)[/dim white]")
-            else:
-                console.print("\n[bold blue]Listening...[/bold blue]")
+            # Use recognize_google for free local-ish STT
+            text = recognizer.recognize_google(audio_data)
+            print(f"[STT] Transcribed: \"{text}\"")
+        except sr.UnknownValueError:
+            text = ""
+            print("[STT] Could not understand audio")
+        except sr.RequestError as e:
+            text = ""
+            print(f"[STT] Could not request results; {e}")
             
-            audio_path, peak, claps = voice_handler.record_audio()
+        # Cleanup
+        try:
+            os.remove(temp_wav_path)
+        except Exception:
+            pass
             
-            # Double clap detection
-            if not is_awake and claps == 2:
-                is_awake = True
-                voice_handler.speak("I heard a double clap, Sir! I'm here. How may I help you?")
-                console.print("[bold cyan]Assistant woke up from a double clap![/bold cyan]")
-                continue
+        return {"status": "success", "text": text}
+    
+    except Exception as e:
+        print(f"Transcription Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-            if not audio_path:
-                continue
 
-            user_input = client.transcribe_audio(audio_path)
+@app.post("/api/chat")
+async def chat_with_friday(req: ChatRequest):
+    """Chats with Groq LLM and returns Edge TTS audio URL along with emotion"""
+    global chat_history
+    try:
+        import json
+        message = req.message
+        if not message:
+            raise HTTPException(status_code=400, detail="Message is required")
             
-            # Remove temp file
-            try: os.remove(audio_path)
-            except: pass
-
-            if not user_input or not str(user_input).strip():
-                continue
-
-            # Robust cleaning: remove punctuation for better matching
-            import string
-            clean_input = str(user_input).strip().lower().translate(str.maketrans('', '', string.punctuation)).strip()
-
-            # Skip if input is empty after cleaning (e.g., just punctuation like ".")
-            if not clean_input:
-                continue
-
-            # Debug logging during sleep
-            if not is_awake:
-                console.print(f"[dim yellow]Sleep-mode heard: '{clean_input}'[/dim yellow]")
-                
-                # Filter out hallucinations even during sleep
-                hallucinations = ["thank you", "thanks for watching", "thanks", "you", "watch", "subscribe"]
-                if clean_input in hallucinations:
-                    continue
-                    
-                wake_words = ["awake", "arise", "waiki waiki", "wake up", "hi", "hello assistant", "secretary"]
-                if any(wake in clean_input for wake in wake_words):
-                    is_awake = True
-                    voice_handler.speak("I'm here, Sir. What can I do for you?")
-                    console.print("[bold cyan]Assistant is now awake![/bold cyan]")
-                continue
-
-            # Filter out common Whisper hallucinations from silence/background noise
-            hallucinations = ["thank you", "thanks for watching", "thanks", "you", "watch", "subscribe"]
-            if clean_input in hallucinations:
-                console.print(f"[dim yellow]Filtered Whisper artifact: '{user_input}'[/dim yellow]")
-                continue
-
-            console.print(f"[bold green]You:[/bold green] {user_input}")
-
-            # Exit trigger
-            if any(quit_word in clean_input for quit_word in ["goodbye", "exit", "quit", "goodbye assistant"]):
-                voice_handler.speak("Of course, Sir. I'll be here if you need me again. Have a wonderful day.")
-                console.print("[yellow]Goodbye![/yellow]")
-                break
+        print(f"[CHAT] You said: \"{message}\"")
+        chat_history.append({"role": "user", "content": message})
+        
+        if len(chat_history) > 21:
+            chat_history = [chat_history[0]] + chat_history[-20:]
             
-            # Sleep/Pause trigger
-            if any(p in clean_input for p in ["sleep", "pause", "that's all for now"]):
-                is_awake = False
-                voice_handler.speak("I'll take a nap then, Sir. Just call me when you need me.")
-                continue
-
-            with console.status("[bold blue]Thinking...", spinner="dots"):
-                token_generator = client.get_response_stream(user_input, system_prompt=system_prompt)
+        completion = await groq_client.chat.completions.create(
+            messages=chat_history,
+            model="llama-3.1-8b-instant",
+            response_format={"type": "json_object"}
+        )
+        
+        reply_json_str = completion.choices[0].message.content or '{"text": "I have nothing to say, Sir.", "emotion": "neutral"}'
+        
+        try:
+            reply_data = json.loads(reply_json_str)
+            reply_text = reply_data.get("text", "...")
+            reply_emotion = reply_data.get("emotion", "neutral")
+        except:
+            reply_text = reply_json_str
+            reply_emotion = "neutral"
             
-            if token_generator:
-                console.print("[bold cyan]Secretary:[/bold cyan] ", end="")
-                voice_handler.speak_stream(token_generator)
-                print()
-            else:
-                console.print("[dim white](Assistant provided no response)[/dim white]")
-            
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Goodbye![/yellow]")
-            break
+        chat_history.append({"role": "assistant", "content": reply_json_str})
+        print(f"[REPLY] Friday [{reply_emotion}]: \"{reply_text}\"")
+        
+        # Cleanup old audio files before generating a new one
+        try:
+            for existing_file in os.listdir(public_audio_dir):
+                if existing_file.startswith("reply_") and existing_file.endswith(".mp3"):
+                    try:
+                        os.remove(os.path.join(public_audio_dir, existing_file))
+                    except Exception:
+                        pass
         except Exception as e:
-            console.print(f"[bold red]Error:[/bold red] {e}")
-            break
+            print(f"[CLEANUP] Failed to clean old audio: {e}")
+
+        # Generate TTS using edge-tts
+        import edge_tts
+        voice = "en-GB-SoniaNeural"
+        file_name = f"reply_{int(time.time())}.mp3"
+        file_path = os.path.join(public_audio_dir, file_name)
+        
+        communicate = edge_tts.Communicate(reply_text, voice)
+        await communicate.save(file_path)
+        print(f"[AUDIO] Generated: {file_name}")
+        
+        return {
+            "status": "success",
+            "text": reply_text,
+            "emotion": reply_emotion,
+            "audio_url": f"http://localhost:8000/audio/{file_name}",
+            "filename": file_name
+        }
+        
+    except Exception as e:
+        print(f"Chat Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/audio/{filename}")
+async def delete_audio(filename: str):
+    """Deletes an audio file after the frontend finishes playing it"""
+    try:
+        # Security check: only allow deleting reply_*.mp3 files
+        if filename.startswith("reply_") and filename.endswith(".mp3"):
+            file_path = os.path.join(public_audio_dir, filename)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"[CLEANUP] Deleted played file: {filename}")
+                return {"status": "success"}
+    except Exception as e:
+        pass
+    return {"status": "ignored"}
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "backend": "python", "groq_key_set": bool(os.getenv("GROQ_API_KEY"))}
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    print("\n🚀 Starting Python FastAPI Backend on http://localhost:8000")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+# Trigger reload
