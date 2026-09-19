@@ -14,11 +14,10 @@ Friday2.0/
 ├── requirements.txt        # Python backend dependencies
 ├── .env.example            # Environment configuration template
 │
-├── memory/                 # Semantic & Structured Memory Subsystem
-│   ├── db.py               # SQLite structured interaction history
-│   ├── vector_store.py     # ChromaDB vector store for semantic recall
-│   ├── extractor.py        # Fact & preference extractor
-│   ├── fast_extractor.py   # Lightweight entity extraction
+├── memory/                 # Fast SQLite Memory Subsystem
+│   ├── db.py               # SQLite structured interaction history & FTS5 search
+│   ├── extractor.py        # Fact & preference extractor (LLM fallback)
+│   ├── fast_extractor.py   # Ultra-fast local entity & preference extraction
 │   └── summarizer.py       # Episodic conversation summarization
 │
 ├── tools/                  # Desktop & Agent Automation Tools
@@ -30,8 +29,7 @@ Friday2.0/
 │   └── memory_tools.py     # Tool bindings for memory querying
 │
 ├── data/                   # Persistent runtime databases (git-ignored)
-│   ├── chroma_db/          # ChromaDB vector embeddings
-│   └── friday_memory.db    # SQLite memory database
+│   └── friday_memory.db    # SQLite memory database (FTS5 indexed)
 │
 └── web/                    # Desktop Frontend (Electron + Vite + React)
     ├── electron/           # Electron main process & IPC handlers

@@ -90,6 +90,8 @@ def extract_fast(text: str) -> List[Dict[str, Any]]:
                 results.append({"category": "fact", "key": key, "value": value, "date_time": today_str, "context": clean})
 
     # 4. spaCy NER for PERSON, ORG, DATE, TIME, GPE
+    if not _available and _nlp is None:
+        _init_spacy()
     if _available and _nlp:
         try:
             doc = _nlp(clean)
@@ -103,7 +105,7 @@ def extract_fast(text: str) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    # Deduplicate by key
+    # Deduplicate results
     seen = set()
     deduped = []
     for r in results:
@@ -115,8 +117,6 @@ def extract_fast(text: str) -> List[Dict[str, Any]]:
 
 
 def is_available() -> bool:
+    if not _available:
+        _init_spacy()
     return _available
-
-
-# Initialize on module load
-_init_spacy()

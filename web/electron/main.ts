@@ -75,50 +75,70 @@ function createWindow() {
 
 function startPythonBackend(): Promise<void> {
   return new Promise((resolve, reject) => {
-    console.log("Starting Python backend...");
-    
-    if (app.isPackaged) {
-      const backendPath = path.join(process.resourcesPath, 'backend.exe');
-      const exeDir = path.dirname(process.execPath); // This is where Friday.exe is located
-      console.log("Spawning compiled backend from: ", backendPath, "with cwd:", exeDir);
-      pythonProcess = spawn(backendPath, [], {
-        cwd: exeDir,
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
-      });
-    } else {
-      // Spawn python from the parent directory with UTF-8 encoding
-      pythonProcess = spawn('python', ['main.py'], {
-        cwd: path.join(__dirname, '../../'), // We are inside web/dist-electron (or web/), so go up one level to Friday2.0
-        env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
-      });
-    }
-
-    pythonProcess.stdout?.on('data', (data) => {
-      console.log(`[Python]: ${data.toString()}`);
+    // Check if backend is already running first
+    const probe = http.get('http://localhost:8000/api/health', (res) => {
+      if (res.statusCode === 200) {
+        console.log("Python backend is already running on port 8000.");
+        return resolve();
+      }
+      doSpawn();
+    });
+    probe.on('error', () => {
+      doSpawn();
     });
 
-    pythonProcess.stderr?.on('data', (data) => {
-      console.error(`[Python ERROR]: ${data.toString()}`);
-    });
+    function doSpawn() {
+      console.log("Starting Python backend...");
+      
+      if (app.isPackaged) {
+        const backendPath = path.join(process.resourcesPath, 'backend.exe');
+        const exeDir = path.dirname(process.execPath); // This is where Friday.exe is located
+        console.log("Spawning compiled backend from: ", backendPath, "with cwd:", exeDir);
+        pythonProcess = spawn(backendPath, [], {
+          cwd: exeDir,
+          env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
+        });
+      } else {
+        // Spawn python from the parent directory with UTF-8 encoding
+        pythonProcess = spawn('python', ['main.py'], {
+          cwd: path.join(__dirname, '../../'), // We are inside web/dist-electron (or web/), so go up one level to Friday2.0
+          env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
+        });
+      }
 
-    // Ping the health endpoint to wait for it to boot up
-    const checkHealth = setInterval(() => {
-      http.get('http://localhost:8000/api/health', (res) => {
-        if (res.statusCode === 200) {
+      pythonProcess.stdout?.on('data', (data) => {
+        console.log(`[Python]: ${data.toString()}`);
+      });
+
+      pythonProcess.stderr?.on('data', (data) => {
+        console.error(`[Python ERROR]: ${data.toString()}`);
+      });
+
+      let isReady = false;
+      const checkHealth = setInterval(() => {
+        if (isReady) return;
+        const req = http.get('http://localhost:8000/api/health', (res) => {
+          if (!isReady && res.statusCode === 200) {
+            isReady = true;
+            clearInterval(checkHealth);
+            clearTimeout(timeoutId);
+            console.log("Python backend is ready!");
+            resolve();
+          }
+        });
+        req.on('error', () => {
+          // Backend not ready yet
+        });
+      }, 500);
+
+      // Timeout after 15 seconds
+      const timeoutId = setTimeout(() => {
+        if (!isReady) {
           clearInterval(checkHealth);
-          console.log("Python backend is ready!");
-          resolve();
+          reject(new Error("Python backend took too long to start"));
         }
-      }).on('error', () => {
-        // Backend not ready yet
-      });
-    }, 500);
-
-    // Timeout after 15 seconds
-    setTimeout(() => {
-      clearInterval(checkHealth);
-      reject(new Error("Python backend took too long to start"));
-    }, 15000);
+      }, 15000);
+    }
   });
 }
 

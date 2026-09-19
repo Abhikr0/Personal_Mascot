@@ -705,7 +705,6 @@ def cleanup_spoken_audio_endpoint():
 
 @app.get("/api/health")
 def health_check():
-    from memory.vector_store import is_available as vector_ok
     from memory.fast_extractor import is_available as fast_ext_ok
     return {
         "status": "ok",
@@ -715,7 +714,7 @@ def health_check():
         "stt_engine": "groq_whisper_large_v3_turbo" if os.getenv("GROQ_API_KEY") else "local_faster_whisper",
         "tts_engine": "edge_tts_streaming",
         "ws_voice": "ws://localhost:8000/ws/voice",
-        "semantic_memory": vector_ok(),
+        "semantic_memory": False,
         "fast_extractor": fast_ext_ok(),
         "mistral_key_set": bool(os.getenv("MISTRAL_API_KEY")),
         "gemini_key_set": bool(os.getenv("GEMINI_API_KEY")),
@@ -769,10 +768,16 @@ if __name__ == "__main__":
     import uvicorn
     print("\n🚀 Starting Sylphya LangGraph Backend on http://localhost:8000")
     print(f"🔧 Tools loaded: {[t.name for t in tools]}")
+
+    # Reload only when explicitly requested via --reload or FRIDAY_RELOAD=1
+    reload_mode = "--reload" in sys.argv or os.environ.get("FRIDAY_RELOAD", "").lower() in ("true", "1")
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
-        reload_excludes=["*.jsonl", "*.db", "*.sqlite*", "data/*", "*.txt", "*.log", "secretary_log.txt"]
+        reload=reload_mode,
+        reload_excludes=[
+            "*.jsonl", "*.db", "*.sqlite*", "data/*", "*.txt", "*.log",
+            "secretary_log.txt", "public/audio/*", "web/*", ".git/*"
+        ]
     )
