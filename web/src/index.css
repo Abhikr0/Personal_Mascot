@@ -33,8 +33,7 @@ html, body {
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  /* Allow clicking and dragging the window by default on the body */
-  -webkit-app-region: drag;
+  -webkit-app-region: no-drag;
 }
 
 #root {
@@ -186,7 +185,7 @@ button, input, .canvas-container, .canvas-wrapper {
   justify-content: center;
   gap: 24px;
   z-index: 20;
-  background: var(--bg-primary);
+  background: transparent;
   transition: opacity 0.6s ease, visibility 0.6s ease;
 }
 
@@ -491,5 +490,16 @@ button, input, .canvas-container, .canvas-wrapper {
 @keyframes typing {
   0%, 100% { transform: scale(0.8); opacity: 0.5; }
   50% { transform: scale(1.2); opacity: 1; }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
 }
 

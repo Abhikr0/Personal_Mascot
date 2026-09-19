@@ -25,14 +25,29 @@ ipcMain.on('set-window-pos', (event, x, y) => {
   }
 });
 
+// Forward mouse events or make transparent window click-through
+ipcMain.on('set-ignore-mouse-events', (event, ignore: boolean, options?: any) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  if (win && !win.isDestroyed()) {
+    try {
+      if (ignore) {
+        win.setIgnoreMouseEvents(true, options || { forward: true });
+      } else {
+        win.setIgnoreMouseEvents(false);
+      }
+    } catch {}
+  }
+});
+
+
 function createWindow() {
   const { width, height } = screen.getPrimaryDisplay().workAreaSize;
   
   mainWindow = new BrowserWindow({
-    width: 350,
-    height: 500,
-    x: width - 350, // Put her in the bottom right corner by default
-    y: height - 500,
+    width: 440,
+    height: 540,
+    x: width - 440, // Put her in the bottom right corner by default
+    y: height - 540,
     transparent: true,
     frame: false,
     hasShadow: false,
@@ -41,6 +56,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
+      webSecurity: false,
     },
   });
 
@@ -61,11 +77,21 @@ function startPythonBackend(): Promise<void> {
   return new Promise((resolve, reject) => {
     console.log("Starting Python backend...");
     
-    // Spawn python from the parent directory with UTF-8 encoding
-    pythonProcess = spawn('python', ['main.py'], {
-      cwd: path.join(__dirname, '../../'), // We are inside web/dist-electron (or web/), so go up one level to Friday2.0
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
-    });
+    if (app.isPackaged) {
+      const backendPath = path.join(process.resourcesPath, 'backend.exe');
+      const exeDir = path.dirname(process.execPath); // This is where Friday.exe is located
+      console.log("Spawning compiled backend from: ", backendPath, "with cwd:", exeDir);
+      pythonProcess = spawn(backendPath, [], {
+        cwd: exeDir,
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
+      });
+    } else {
+      // Spawn python from the parent directory with UTF-8 encoding
+      pythonProcess = spawn('python', ['main.py'], {
+        cwd: path.join(__dirname, '../../'), // We are inside web/dist-electron (or web/), so go up one level to Friday2.0
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
+      });
+    }
 
     pythonProcess.stdout?.on('data', (data) => {
       console.log(`[Python]: ${data.toString()}`);
@@ -104,10 +130,17 @@ app.whenReady().then(async () => {
   }
   createWindow();
 
-  // Register global hands-free hotkey
+  // Register global hands-free hotkey (Ctrl+Space to talk / interrupt)
   globalShortcut.register('CommandOrControl+Space', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('hotkey-listen');
+    }
+  });
+
+  // Register global hotkey to toggle Always-On / Wake Word mode (Ctrl+Shift+A)
+  globalShortcut.register('CommandOrControl+Shift+A', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('hotkey-toggle-always-on');
     }
   });
 });
@@ -135,10 +168,23 @@ app.on('activate', () => {
   }
 });
 
-// Broadcast global cursor position to the renderer for smooth 30FPS outside-window tracking
+// Broadcast window-relative cursor position at 60FPS for flawless desktop-wide tracking
+let lastCursorX = -99999;
+let lastCursorY = -99999;
+
 setInterval(() => {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    const point = screen.getCursorScreenPoint();
-    mainWindow.webContents.send('cursor-pos', point.x, point.y);
+    try {
+      const point = screen.getCursorScreenPoint();
+      const [winX, winY] = mainWindow.getPosition();
+      const relX = Math.round(point.x - winX);
+      const relY = Math.round(point.y - winY);
+      if (relX !== lastCursorX || relY !== lastCursorY) {
+        lastCursorX = relX;
+        lastCursorY = relY;
+        mainWindow.webContents.send('cursor-pos', relX, relY);
+      }
+    } catch {}
   }
-}, 1000 / 30);
+}, 1000 / 60);
+

@@ -1,0 +1,47 @@
+{
+	"Version": 3,
+	"FileReferences": {
+		"Moc": "jian.moc3",
+		"Textures": [
+			"jian.4096/texture_00.png"
+		],
+		"Physics": "jian.physics3.json",
+		"DisplayInfo": "jian.cdi3.json",
+		"Motions": {
+			"Idle": [
+				{
+					"File": "Scene1.motion3.json"
+				}
+			]
+		},
+		"Expressions": [
+			{ "Name": "blush", "File": "脸红.exp3.json" },
+			{ "Name": "dark", "File": "脸黑.exp3.json" },
+			{ "Name": "blood", "File": "血.exp3.json" },
+			{ "Name": "angry", "File": "生气.exp3.json" },
+			{ "Name": "starEyes", "File": "星星眼.exp3.json" },
+			{ "Name": "blankEyes", "File": "白眼.exp3.json" },
+			{ "Name": "cry", "File": "泪.exp3.json" },
+			{ "Name": "heartEyes", "File": "爱心眼.exp3.json" },
+			{ "Name": "handR", "File": "右手.exp3.json" },
+			{ "Name": "handL", "File": "左手.exp3.json" }
+		]
+	},
+	"Groups": [
+		{
+			"Target": "Parameter",
+			"Name": "LipSync",
+			"Ids": [
+				"ParamMouthOpenY"
+			]
+		},
+		{
+			"Target": "Parameter",
+			"Name": "EyeBlink",
+			"Ids": [
+				"ParamEyeLOpen",
+				"ParamEyeROpen"
+			]
+		}
+	]
+}

@@ -1,8 +1,33 @@
 fastapi
-uvicorn
+uvicorn[standard]
+websockets
 python-multipart
-groq
 edge-tts
 SpeechRecognition
 python-dotenv
 pydub
+langchain-google-genai
+langgraph
+langchain-core
+langchain-community
+duckduckgo-search
+pyautogui
+pywin32
+psutil
+pillow
+faster-whisper
+mistralai
+langchain-mistralai
+pystray
+keyboard
+
+# Pillar 1: Real-time voice streaming (uvicorn[standard] already covers websockets)
+# starlette already included via fastapi
+
+# Pillar 3: Semantic memory
+chromadb
+sentence-transformers
+spacy
+
+# Optional: local ultra-fast TTS (no internet needed, 82MB ONNX model)
+# kokoro-onnx

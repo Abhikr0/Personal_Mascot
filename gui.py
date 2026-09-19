@@ -1,3 +1,7 @@
+"""
+gui.py — Sylphya desktop integration: system tray icon + global hotkey (Alt+Space)
+Sends IPC signals to the Electron frontend window.
+"""
 import customtkinter as ctk
 import tkinter as tk
 from PIL import Image, ImageTk, ImageDraw
@@ -5,6 +9,70 @@ import threading
 import time
 import math
 import os
+import sys
+import subprocess
+
+
+# ─── System Tray (pystray) ─────────────────────────────────────────────────────
+
+def _create_tray_icon_image() -> Image.Image:
+    """Draw a simple cat-silhouette icon for the system tray."""
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    # Body circle
+    draw.ellipse([12, 22, 52, 60], fill=(180, 140, 255, 230))
+    # Head circle
+    draw.ellipse([16, 8, 48, 36], fill=(200, 160, 255, 230))
+    # Left ear
+    draw.polygon([(16, 14), (10, 2), (22, 8)], fill=(220, 180, 255, 230))
+    # Right ear
+    draw.polygon([(48, 14), (54, 2), (42, 8)], fill=(220, 180, 255, 230))
+    # Eyes
+    draw.ellipse([22, 16, 28, 22], fill=(60, 40, 120, 255))
+    draw.ellipse([36, 16, 42, 22], fill=(60, 40, 120, 255))
+    return img
+
+
+def _start_tray(on_show, on_hide, on_quit):
+    """Start pystray system tray icon in its own thread."""
+    try:
+        import pystray
+        icon_image = _create_tray_icon_image()
+
+        def _on_show(icon, item): on_show()
+        def _on_hide(icon, item): on_hide()
+        def _on_quit(icon, item):
+            icon.stop()
+            on_quit()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Show Sylphya", _on_show, default=True),
+            pystray.MenuItem("Hide", _on_hide),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", _on_quit),
+        )
+        icon = pystray.Icon("Sylphya", icon_image, "Sylphya — Friday 2.0", menu)
+        icon.run()
+    except ImportError:
+        print("[Tray] pystray not installed — system tray disabled.")
+    except Exception as e:
+        print(f"[Tray] Error: {e}")
+
+
+def _start_global_hotkey(on_summon):
+    """Listen for Alt+Space globally to summon/dismiss Sylphya from any app."""
+    try:
+        import keyboard
+        keyboard.add_hotkey("alt+space", on_summon, suppress=True)
+        print("[Hotkey] Alt+Space registered — press to summon Sylphya from anywhere!")
+        keyboard.wait()  # Block this thread
+    except ImportError:
+        print("[Hotkey] 'keyboard' package not installed — global hotkey disabled.")
+    except Exception as e:
+        print(f"[Hotkey] Error: {e}")
+
+
+# ─── Animated Orb GUI ─────────────────────────────────────────────────────────
 
 class FridayGUI(ctk.CTk):
     def __init__(self):
@@ -22,6 +90,9 @@ class FridayGUI(ctk.CTk):
         x = self.winfo_screenwidth() - width - 40
         y = self.winfo_screenheight() - height - 80
         self.geometry(f"{width}x{height}+{x}+{y}")
+        self._win_x = x
+        self._win_y = y
+        self._visible = True
 
         # State Variables
         self.assistant_state = "idle"
@@ -43,12 +114,12 @@ class FridayGUI(ctk.CTk):
         self.info_panel.pack(side="right", fill="both", expand=True, padx=15, pady=20)
 
         self.msg_display = tk.Text(
-            self.info_panel, 
-            wrap="word", 
-            bg="#010101", 
-            fg="#00D2FF", 
-            font=("Segoe UI Variable", 11, "italic"), 
-            bd=0, 
+            self.info_panel,
+            wrap="word",
+            bg="#010101",
+            fg="#00D2FF",
+            font=("Segoe UI Variable", 11, "italic"),
+            bd=0,
             highlightthickness=0,
             padx=5,
             pady=5
@@ -62,11 +133,50 @@ class FridayGUI(ctk.CTk):
         for widget in [self, self.main_container, self.canvas, self.info_panel]:
             widget.bind("<Button-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.do_drag)
-        
+
         self._offset_x = 0
         self._offset_y = 0
 
+        # ── System Tray Integration ──────────────────────────────────────────
+        tray_thread = threading.Thread(
+            target=_start_tray,
+            args=(self._show_window, self._hide_window, self._quit_app),
+            daemon=True
+        )
+        tray_thread.start()
+
+        # ── Global Hotkey: Alt+Space ─────────────────────────────────────────
+        hotkey_thread = threading.Thread(
+            target=_start_global_hotkey,
+            args=(self._toggle_visibility,),
+            daemon=True
+        )
+        hotkey_thread.start()
+
         self.update_animation()
+
+    # ── Window control methods ───────────────────────────────────────────────
+
+    def _show_window(self):
+        self.after(0, lambda: (
+            self.deiconify(),
+            self.attributes("-topmost", True),
+            self.lift()
+        ))
+        self._visible = True
+
+    def _hide_window(self):
+        self.after(0, self.withdraw)
+        self._visible = False
+
+    def _toggle_visibility(self):
+        if self._visible:
+            self._hide_window()
+        else:
+            self._show_window()
+
+    def _quit_app(self):
+        self.after(0, self.destroy)
 
     def start_drag(self, event):
         self._offset_x = event.x
@@ -76,6 +186,8 @@ class FridayGUI(ctk.CTk):
         x = self.winfo_pointerx() - self._offset_x
         y = self.winfo_pointery() - self._offset_y
         self.geometry(f"+{x}+{y}")
+        self._win_x = x
+        self._win_y = y
 
     def init_particles(self):
         import random
@@ -89,17 +201,28 @@ class FridayGUI(ctk.CTk):
             })
 
     def update_animation(self):
-        if not self.winfo_exists(): return
+        if not self.winfo_exists():
+            return
         try:
             self.canvas.delete("all")
             cx, cy = 100, 100
-            
-            color_map = {"idle": "#00D2FF", "listening": "#FF3131", "thinking": "#FFD700", "speaking": "#39FF14"}
+
+            color_map = {
+                "idle": "#00D2FF",
+                "listening": "#FF3131",
+                "thinking": "#FFD700",
+                "speaking": "#39FF14",
+                "excited": "#FF69B4",
+                "sleeping": "#8B7EC8",
+            }
             base_color = color_map.get(self.assistant_state, "#00D2FF")
-            
-            speed_mult = 2.8 if self.assistant_state == "thinking" else 1.0
+
+            speed_mult = 2.8 if self.assistant_state == "thinking" else (
+                1.8 if self.assistant_state == "excited" else
+                0.4 if self.assistant_state == "sleeping" else 1.0
+            )
             self.rotation_angle += 0.022 * speed_mult
-            
+
             projected = []
             for p in self.particles:
                 phi = p['phi'] + self.rotation_angle * p['speed'] * 50
@@ -113,10 +236,10 @@ class FridayGUI(ctk.CTk):
 
             projected.sort(key=lambda x: x[0])
             for z, px, py, s in projected:
-                self.canvas.create_rectangle(px-s, py-s, px+s, py+s, fill=base_color, outline="")
+                self.canvas.create_rectangle(px - s, py - s, px + s, py + s, fill=base_color, outline="")
 
             self.after(20, self.update_animation)
-        except:
+        except Exception:
             pass
 
     def update_status(self, text, state="idle"):
@@ -130,9 +253,10 @@ class FridayGUI(ctk.CTk):
         else:
             self.msg_display.delete("1.0", tk.END)
             self.msg_display.insert(tk.END, f"FRIDAY: {message}", "friday")
-        
+
         self.msg_display.see(tk.END)
         self.msg_display.config(state="disabled")
+
 
 if __name__ == "__main__":
     app = FridayGUI()

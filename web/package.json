@@ -6,27 +6,51 @@
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
+    "start": "vite",
     "build": "tsc -b && vite build",
+    "build:exe": "vite build && electron-builder",
     "lint": "oxlint",
     "preview": "vite preview"
+  },
+  "build": {
+    "appId": "com.friday.app",
+    "productName": "Friday Mascot",
+    "directories": {
+      "output": "release"
+    },
+    "electronDist": "electron-cache",
+    "win": {
+      "target": "portable"
+    },
+    "portable": {
+      "artifactName": "Friday.exe"
+    },
+    "extraResources": [
+      {
+        "from": "../dist/backend.exe",
+        "to": "backend.exe"
+      }
+    ]
   },
   "dependencies": {
     "pixi-live2d-display": "^0.4.0",
     "pixi.js": "^6.5.10",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "url": "^0.11.4"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.4",
-    "concurrently": "^10.0.4",
     "electron": "^43.3.0",
+    "electron-builder": "^26.15.3",
     "oxlint": "^1.75.0",
     "typescript": "~6.0.2",
     "vite": "^8.2.0",
     "vite-plugin-electron": "^1.1.1",
-    "vite-plugin-electron-renderer": "^1.0.0"
+    "vite-plugin-electron-renderer": "^1.0.0",
+    "vite-plugin-node-polyfills": "^0.28.0"
   }
 }
