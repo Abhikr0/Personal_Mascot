@@ -102,6 +102,13 @@ npm run build:exe
 ```
 
 ---
+## Reference video 
+
+
+
+https://github.com/user-attachments/assets/55e4a9b3-648b-462a-8a7e-6d2263d40457
+
+
 
 ## Character & Live2D System
 
