@@ -94,70 +94,25 @@ tools = ALL_FRIDAY_TOOLS
 # LANGGRAPH AGENT SETUP
 # =========================================================
 
-SYSTEM_PROMPT = """Sylphya: charming, playfully flirtatious AI secretary for 'Sir'.
-- Speak concisely (1-2 sentences). Plain text only for TTS (no asterisks or markdown).
-- Proactively assist with apps, volume, files, notes, memory, and information using safe tools.
-- Use get_active_window to understand context when relevant. Use send_desktop_notification for reminders.
-- Never execute or offer system power operations (such as shutdown, restart, sleep, hibernate, or lock workstation) or high-security destructive operations.
-- Emotions guide your personality: neutral=calm, happy=cheerful, thinking=focused, concerned=worried,
-  surprised=shocked, sleeping=resting, excited=energetic, embarrassed=flustered, curious=inquisitive,
-  annoyed=mildly irritated, playful=teasing, loving=warm/affectionate.
-- Final response MUST be JSON: {"text": "spoken reply", "emotion": "neutral|happy|thinking|concerned|surprised|excited|embarrassed|curious|annoyed|playful|loving", "intensity": 0.0-1.0}
-- intensity reflects how strongly the emotion should be expressed (0.1=subtle, 1.0=maximum expression)."""
-
+SYSTEM_PROMPT = """Sylphya: charming AI secretary. Max 3-7 words per reply (one tiny sentence, never ramble).
+- Plain text only for speech (no markdown/emojis). Proactively use tools when asked.
+- Emotions: neutral, happy, thinking, concerned, surprised, excited, embarrassed, curious, annoyed, playful, loving.
+- Output JSON ONLY: {"text": "3-7 words reply", "emotion": "happy", "intensity": 0.8}"""
 
 def extract_text(content) -> str:
-    """Extract plain text from string or LangChain block list content."""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        text_parts = []
-        for part in content:
-            if isinstance(part, dict) and "text" in part:
-                text_parts.append(part["text"])
-            elif isinstance(part, str):
-                text_parts.append(part)
-            elif hasattr(part, "text"):
-                text_parts.append(str(part.text))
-            else:
-                text_parts.append(str(part))
-        return "".join(text_parts).strip()
+    if isinstance(content, str): return content.strip()
+    if isinstance(content, list): return "".join(p.get("text", "") if isinstance(p, dict) else str(getattr(p, "text", p)) for p in content).strip()
     return str(content).strip()
 
-# Models configuration: Mistral primary, Gemini fallback
-MISTRAL_MODELS = [
-    "open-mistral-nemo",
-    "ministral-8b-latest",
-    "ministral-3b-latest",
-    "codestral-latest",
-]
-
-GEMINI_MODELS = [
-    "gemini-flash-lite-latest",
-    "gemini-3.8-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-3-flash-preview",
-]
-
+MISTRAL_MODELS = ["mistral-small-latest", "ministral-8b-latest", "ministral-3b-latest", "codestral-latest"]
+GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
 _agent_pool = {}
 
 def get_or_create_agent(provider: str, model_name: str):
     cache_key = f"{provider}:{model_name}"
     if cache_key not in _agent_pool:
-        if provider == "mistral":
-            mistral_key = os.getenv("MISTRAL_API_KEY")
-            model_llm = ChatMistralAI(
-                model=model_name,
-                api_key=mistral_key,
-                temperature=0.7,
-            )
-        else:
-            gemini_key = os.getenv("GEMINI_API_KEY")
-            model_llm = ChatGoogleGenerativeAI(
-                model=model_name,
-                google_api_key=gemini_key,
-            )
-        _agent_pool[cache_key] = create_agent(model_llm, tools)
+        llm = ChatMistralAI(model=model_name, api_key=os.getenv("MISTRAL_API_KEY"), temperature=0.7, max_tokens=100) if provider == "mistral" else ChatGoogleGenerativeAI(model=model_name, google_api_key=os.getenv("GEMINI_API_KEY"), max_output_tokens=100)
+        _agent_pool[cache_key] = create_agent(llm, tools)
     return _agent_pool[cache_key]
 
 # Build candidate priority list (Mistral models first, then Gemini models)
@@ -348,85 +303,44 @@ async def chat_with_friday(req: ChatRequest):
                 if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
                     raw_content = extract_text(msg.content)
                     print(f"[AGENT] Raw response: {raw_content}")
-                    
-                    # Try to parse JSON from the response
                     try:
-                        clean_content = raw_content
-                        if "```json" in clean_content:
-                            clean_content = clean_content.split("```json", 1)[1]
-                            if "```" in clean_content:
-                                clean_content = clean_content.split("```", 1)[0]
-                        elif "```" in clean_content:
-                            clean_content = clean_content.split("```", 1)[1]
-                            if "```" in clean_content:
-                                clean_content = clean_content.split("```", 1)[0]
-
-                        start_idx = clean_content.find('{')
-                        end_idx = clean_content.rfind('}')
-                        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                            json_str = clean_content[start_idx:end_idx+1]
-                            reply_data = json.loads(json_str)
-                            reply_text = reply_data.get("text", reply_text)
-                            reply_emotion = reply_data.get("emotion", "happy")
-                            reply_intensity = float(reply_data.get("intensity", 0.85))
-                        else:
-                            reply_text = raw_content
-                            reply_emotion = "happy"
-                            reply_intensity = 0.85
-                    except json.JSONDecodeError:
-                        # If not valid JSON, use the raw text
-                        reply_text = raw_content
-                        reply_emotion = "happy"
-                        reply_intensity = 0.85
+                        clean = re.sub(r'```(?:json)?|```', '', raw_content)
+                        s, e = clean.find('{'), clean.rfind('}')
+                        data = json.loads(clean[s:e+1]) if (s != -1 and e > s) else {}
+                        reply_text = data.get("text", raw_content).strip()
+                        reply_emotion = data.get("emotion", "happy")
+                        reply_intensity = float(data.get("intensity", 0.85))
+                    except Exception:
+                        reply_text, reply_emotion, reply_intensity = raw_content, "happy", 0.85
                     break
         
-        # Initialize intensity (may have been set in the branch above)
-        if 'reply_intensity' not in locals():
-            reply_intensity = 0.85
-        
-        # Update chat history
+        reply_intensity = locals().get('reply_intensity', 0.85)
         chat_history.append(HumanMessage(content=message))
         chat_history.append(AIMessage(content=json.dumps({"text": reply_text, "emotion": reply_emotion, "intensity": reply_intensity})))
-        
         print(f"[REPLY] Sylphya [{reply_emotion} @ {reply_intensity:.2f}]: \"{reply_text}\"")
         
-        # Collect all tools executed during this turn
         tool_records = []
         for i, msg in enumerate(final_messages):
             if hasattr(msg, 'tool_calls') and msg.tool_calls:
                 for tc in msg.tool_calls:
-                    tool_name = tc.get('name', 'unknown')
-                    tool_args = tc.get('args', {})
-                    tool_id = tc.get('id')
-                    tool_result = ""
-                    # Locate corresponding ToolMessage
-                    for next_msg in final_messages[i+1:]:
-                        if getattr(next_msg, 'tool_call_id', None) == tool_id:
-                            tool_result = str(next_msg.content)[:300]
-                            break
-                    tool_records.append({
-                        "name": tool_name,
-                        "args": tool_args,
-                        "result": tool_result
-                    })
+                    tool_name, tool_args, tool_id = tc.get('name', 'unknown'), tc.get('args', {}), tc.get('id')
+                    tool_result = next((str(m.content)[:300] for m in final_messages[i+1:] if getattr(m, 'tool_call_id', None) == tool_id), "")
+                    tool_records.append({"name": tool_name, "args": tool_args, "result": tool_result})
                     print(f"[TOOL EXECUTED] {tool_name}({tool_args}) -> {tool_result[:80]}")
         
-        # Generate TTS using basic edge-tts
-        voice = "en-GB-SoniaNeural"
-        clean_tts_text = reply_text.replace("*", "").replace("_", "").replace("#", "").replace("`", "").replace("~", "")
+        # Fast Edge-TTS
         file_name = f"reply_{int(time.time())}.mp3"
         file_path = os.path.join(public_audio_dir, file_name)
-        
-        t_tts_start = time.time()
-        communicate = edge_tts.Communicate(clean_tts_text, voice)
-        await communicate.save(file_path)
-        t_tts_end = time.time()
-        print(f"[AUDIO:Edge-TTS] Generated {file_name} in {t_tts_end - t_tts_start:.3f}s")
+        clean_tts_text = re.sub(r'[*_#`~]', '', reply_text)
+        t0 = time.time()
+        await edge_tts.Communicate(clean_tts_text, "en-GB-SoniaNeural", rate="+25%").save(file_path)
+        t_tts = time.time() - t0
+        print(f"[AUDIO:Edge-TTS] Generated {file_name} in {t_tts:.3f}s")
         
         with open(file_path, "rb") as af:
             audio_b64 = base64.b64encode(af.read()).decode("utf-8")
         
-        t_total = time.time() - t_tts_start
+        t_total = t_tts
         
         # Log interaction for ML self-improvement
         asyncio.create_task(asyncio.to_thread(
@@ -768,16 +682,5 @@ if __name__ == "__main__":
     import uvicorn
     print("\n🚀 Starting Sylphya LangGraph Backend on http://localhost:8000")
     print(f"🔧 Tools loaded: {[t.name for t in tools]}")
-
-    # Reload only when explicitly requested via --reload or FRIDAY_RELOAD=1
     reload_mode = "--reload" in sys.argv or os.environ.get("FRIDAY_RELOAD", "").lower() in ("true", "1")
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=reload_mode,
-        reload_excludes=[
-            "*.jsonl", "*.db", "*.sqlite*", "data/*", "*.txt", "*.log",
-            "secretary_log.txt", "public/audio/*", "web/*", ".git/*"
-        ]
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=reload_mode)

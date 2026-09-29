@@ -67,6 +67,10 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 
+  mainWindow.webContents.on('console-message', (_event, _level, message, line, sourceId) => {
+    console.log(`[Renderer]: ${message} (${sourceId}:${line})`);
+  });
+
   // Prevent white flashes on load
   mainWindow.on('ready-to-show', () => {
     mainWindow?.show();

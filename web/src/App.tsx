@@ -9,79 +9,15 @@ Live2DModel.registerTicker(PIXI.Ticker);
 
 import {
   JIAN_CHARACTER,
-  CHARACTERS,
-  type CharacterProfile,
   type AssistantEmotion,
-  getJianCharacter,
 } from './characters';
-
-export { JIAN_CHARACTER, CHARACTERS, getJianCharacter, type CharacterProfile, type AssistantEmotion };
 
 type AppState = 'loading' | 'ready' | 'error';
 type ListenState = 'idle' | 'listening' | 'processing' | 'speaking';
 
-// Streaming TTS audio chunk queue player
-export class AudioChunkPlayer {
-  private ctx: AudioContext;
-  private queue: ArrayBuffer[] = [];
-  private playing = false;
-  private nextTime = 0;
-  onEnded?: () => void;
-  onChunk?: (rms: number) => void;
-
-  constructor(ctx: AudioContext) {
-    this.ctx = ctx;
-  }
-
-  async enqueue(chunk: ArrayBuffer) {
-    this.queue.push(chunk);
-    if (!this.playing) this._pump();
-  }
-
-  private async _pump() {
-    if (this.queue.length === 0) {
-      this.playing = false;
-      setTimeout(() => { if (this.queue.length === 0) this.onEnded?.(); }, 80);
-      return;
-    }
-    this.playing = true;
-    const chunk = this.queue.shift()!;
-    try {
-      const buf = await this.ctx.decodeAudioData(chunk.slice(0));
-      const src = this.ctx.createBufferSource();
-      src.buffer = buf;
-      // Analyser for lip sync on streamed chunks
-      const analyser = this.ctx.createAnalyser();
-      analyser.fftSize = 256;
-      src.connect(analyser);
-      analyser.connect(this.ctx.destination);
-      const td = new Uint8Array(analyser.fftSize);
-      const rmsLoop = () => {
-        analyser.getByteTimeDomainData(td);
-        let s = 0; for (const v of td) s += ((v - 128) / 128) ** 2;
-        this.onChunk?.(Math.sqrt(s / td.length));
-        if (this.playing) requestAnimationFrame(rmsLoop);
-      };
-      requestAnimationFrame(rmsLoop);
-      const when = Math.max(this.ctx.currentTime, this.nextTime);
-      src.start(when);
-      this.nextTime = when + buf.duration;
-      src.onended = () => this._pump();
-    } catch {
-      this._pump();
-    }
-  }
-
-  stop() {
-    this.playing = false;
-    this.queue = [];
-    this.nextTime = 0;
-  }
-}
-
 // Window Dimensions (un-cropped generous framing)
-export const WIN_W = 440;
-export const WIN_H = 540;
+const WIN_W = 440;
+const WIN_H = 540;
 
 // Wake Word & Intent Regex Patterns
 const WAKE_WORD_PATTERN = /^(?:(?:hey|hi|hello|ok|okay|yo|listen)\s+)?(?:sylphya|friday)\b[,:\s]*/i;
@@ -427,7 +363,6 @@ function App() {
     try {
       if (appRef.current) {
         try {
-          appRef.current.ticker.stop();
           appRef.current.destroy(true, { children: true });
         } catch {}
         appRef.current = null;
@@ -441,8 +376,10 @@ function App() {
         resolution: 1,
         autoDensity: false,
         preserveDrawingBuffer: true,
-        autoStart: true,
+        sharedTicker: true,
       });
+
+      PIXI.Ticker.shared.start();
 
       canvasRef.current.innerHTML = '';
       canvasRef.current.appendChild(app.view as unknown as HTMLElement);
@@ -450,22 +387,15 @@ function App() {
 
       const model = await Live2DModel.from(char.modelPath, { 
         autoInteract: false, 
-        autoUpdate: false,
+        autoUpdate: true,
       } as any);
 
-      if (!appRef.current || app !== appRef.current || !app.screen) {
+      if (!canvasRef.current || !appRef.current) {
         model.destroy();
         return;
       }
 
       modelRef.current = model;
-
-      // Robust dedicated per-frame ticker update (guaranteed 60FPS animation)
-      app.ticker.add(() => {
-        if (modelRef.current && !modelRef.current._destroyed) {
-          modelRef.current.update(app.ticker.deltaMS);
-        }
-      });
 
       const baseWidth = (model as any).internalModel.width || model.width;
       const baseHeight = (model as any).internalModel.height || model.height;
@@ -709,14 +639,13 @@ function App() {
       stopCurrentSpeech();
       if (appRef.current) {
         try {
-          appRef.current.ticker.stop();
           appRef.current.destroy(true, { children: true, texture: true, baseTexture: true });
         } catch {}
         appRef.current = null;
         modelRef.current = null;
       }
     };
-  }, [initLive2D, stopCurrentSpeech]);
+  }, []);
 
   // --- Feedback submission ---
   const submitFeedback = useCallback(async (positive: boolean) => {
