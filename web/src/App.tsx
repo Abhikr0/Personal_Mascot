@@ -197,6 +197,7 @@ function App() {
   const mouthOpenRef = useRef(0);
   const animTimeRef = useRef(0);
   const lastFrameTimeRef = useRef(0);
+  const blinkTimerRef = useRef(3.0);
   const currentAudioFilenameRef = useRef<string | null>(null);
   const sendToBackendRef = useRef<((msg: string) => Promise<void> | void) | undefined>(undefined);
 
@@ -425,7 +426,10 @@ function App() {
 
     try {
       if (appRef.current) {
-        appRef.current.destroy(true, { children: true });
+        try {
+          appRef.current.ticker.stop();
+          appRef.current.destroy(true, { children: true });
+        } catch {}
         appRef.current = null;
       }
 
@@ -437,10 +441,8 @@ function App() {
         resolution: 1,
         autoDensity: false,
         preserveDrawingBuffer: true,
-        sharedTicker: true,
+        autoStart: true,
       });
-
-      PIXI.Ticker.shared.start();
 
       canvasRef.current.innerHTML = '';
       canvasRef.current.appendChild(app.view as unknown as HTMLElement);
@@ -448,7 +450,7 @@ function App() {
 
       const model = await Live2DModel.from(char.modelPath, { 
         autoInteract: false, 
-        autoUpdate: true,
+        autoUpdate: false,
       } as any);
 
       if (!appRef.current || app !== appRef.current || !app.screen) {
@@ -458,8 +460,9 @@ function App() {
 
       modelRef.current = model;
 
+      // Robust dedicated per-frame ticker update (guaranteed 60FPS animation)
       app.ticker.add(() => {
-        if (modelRef.current && modelRef.current.deltaTime === 0) {
+        if (modelRef.current && !modelRef.current._destroyed) {
           modelRef.current.update(app.ticker.deltaMS);
         }
       });
@@ -483,8 +486,6 @@ function App() {
         }
       });
 
-      setState('ready');
-
       // Animation State Caches
       const currentParams: Record<string, number> = {};
       const proceduralState: Record<string, number> = {};
@@ -502,19 +503,19 @@ function App() {
         const baseParams = char.emotionMap[activeEmotion] || char.emotionMap['neutral'];
         const targetParams: Record<string, number> = { ...baseParams };
 
-        // Origin at (WIN_W / 2, 180)
+        // Desktop / Cursor tracking with origin at (WIN_W / 2, 180)
         const dx = cursorPosRef.current.x - (WIN_W / 2);
         const dy = cursorPosRef.current.y - 180;
 
         const targetEyeX = Math.tanh(dx / 120);
         const targetEyeY = Math.tanh(-dy / 120);
-        const targetAngleX = Math.tanh(dx / 220) * 28;
-        const targetAngleY = Math.tanh(-dy / 220) * 20;
+        const targetAngleX = Math.tanh(dx / 220) * 26;
+        const targetAngleY = Math.tanh(-dy / 220) * 18;
         const targetAngleZ = Math.tanh(-dx / 280) * 8;
-        const targetBodyX = Math.tanh(dx / 320) * 6;
+        const targetBodyX = Math.tanh(dx / 320) * 5;
 
-        const kEye = 1 - Math.exp(-14 * dt);
-        const kHead = 1 - Math.exp(-8 * dt);
+        const kEye = 1 - Math.exp(-12 * dt);
+        const kHead = 1 - Math.exp(-7 * dt);
         const c = cursorPosRef.current;
         c.smoothEyeX += (targetEyeX - c.smoothEyeX) * kEye;
         c.smoothEyeY += (targetEyeY - c.smoothEyeY) * kEye;
@@ -523,7 +524,23 @@ function App() {
         c.smoothAngleZ += (targetAngleZ - c.smoothAngleZ) * kHead;
         c.smoothBodyX += (targetBodyX - c.smoothBodyX) * kHead;
 
-        if (activeEmotion === 'sleeping' || isSleepingRef.current) {
+        const isSleep = activeEmotion === 'sleeping' || isSleepingRef.current;
+        const currState = listenStateRef.current;
+
+        // Natural Procedural Eye Blinking (blinks naturally every 2.5-5.5s)
+        blinkTimerRef.current -= dt;
+        let eyeBlinkMultiplier = 1.0;
+        if (blinkTimerRef.current <= 0) {
+          const blinkProgress = -blinkTimerRef.current / 0.16; // 160ms blink duration
+          if (blinkProgress < 1.0) {
+            eyeBlinkMultiplier = blinkProgress < 0.5 ? (1.0 - blinkProgress * 2.0) : ((blinkProgress - 0.5) * 2.0);
+          } else {
+            blinkTimerRef.current = 2.5 + Math.random() * 3.0; // Next blink in 2.5-5.5s
+            eyeBlinkMultiplier = 1.0;
+          }
+        }
+
+        if (isSleep) {
           targetParams.ParamEyeLOpen = 0;
           targetParams.ParamEyeROpen = 0;
           targetParams.ParamEyeBallX = 0;
@@ -531,17 +548,24 @@ function App() {
         } else {
           if (targetParams.ParamEyeBallX === undefined) targetParams.ParamEyeBallX = c.smoothEyeX;
           if (targetParams.ParamEyeBallY === undefined) targetParams.ParamEyeBallY = c.smoothEyeY;
+
+          // Apply natural eye blink when not in specific forced-eye states
+          if (currState !== 'listening') {
+            const baseL = targetParams.ParamEyeLOpen !== undefined ? targetParams.ParamEyeLOpen : 1.0;
+            const baseR = targetParams.ParamEyeROpen !== undefined ? targetParams.ParamEyeROpen : 1.0;
+            targetParams.ParamEyeLOpen = baseL * eyeBlinkMultiplier;
+            targetParams.ParamEyeROpen = baseR * eyeBlinkMultiplier;
+          }
         }
 
-        const currState = listenStateRef.current;
-
-        if (currState === 'idle' && activeEmotion !== 'sleeping' && !isSleepingRef.current) {
-          const cheerfulBreath = Math.sin(t * 1.5) * 0.05;
-          targetParams.ParamMouthForm = Math.min(1, Math.max(0.6, (targetParams.ParamMouthForm ?? 0.85) + cheerfulBreath));
-          targetParams.ParamEyeLSmile = Math.min(1, Math.max(0.4, (targetParams.ParamEyeLSmile ?? 0.65) + cheerfulBreath * 0.4));
-          targetParams.ParamEyeRSmile = Math.min(1, Math.max(0.4, (targetParams.ParamEyeRSmile ?? 0.65) + cheerfulBreath * 0.4));
-          targetParams.ParamSwitch2 = Math.min(1, Math.max(0.2, (targetParams.ParamSwitch2 ?? 0.35) + Math.sin(t * 0.9) * 0.05));
-          targetParams.Ear_smile = Math.min(1, Math.max(0.1, (targetParams.Ear_smile ?? 0.25) + Math.sin(t * 0.7) * 0.1));
+        // Cheerful micro-expressions during idle
+        if (currState === 'idle' && !isSleep) {
+          const cheerfulBreath = Math.sin(t * 1.8) * 0.08;
+          targetParams.ParamMouthForm = Math.min(1, Math.max(0.5, (targetParams.ParamMouthForm ?? 0.85) + cheerfulBreath));
+          targetParams.ParamEyeLSmile = Math.min(1, Math.max(0.3, (targetParams.ParamEyeLSmile ?? 0.65) + cheerfulBreath * 0.4));
+          targetParams.ParamEyeRSmile = Math.min(1, Math.max(0.3, (targetParams.ParamEyeRSmile ?? 0.65) + cheerfulBreath * 0.4));
+          targetParams.ParamSwitch2 = Math.min(1, Math.max(0.2, (targetParams.ParamSwitch2 ?? 0.35) + Math.sin(t * 1.2) * 0.06));
+          targetParams.Ear_smile = Math.min(1, Math.max(0.1, (targetParams.Ear_smile ?? 0.25) + Math.sin(t * 1.0) * 0.12));
         }
 
         if (char.switchIds) {
@@ -554,10 +578,8 @@ function App() {
 
         // 1. Emotion & Parameter Blending with intensity scaling and smooth lerp
         const intensity = emotionIntensityRef.current ?? 1.0;
-        // Lerp speed: faster for high-intensity emotions, slower for subtle ones
-        const lerpSpeed = 0.06 + intensity * 0.12;
+        const lerpSpeed = 0.08 + intensity * 0.14;
         for (const [param, rawTarget] of Object.entries(targetParams)) {
-          // Scale emotion params toward neutral at lower intensity (but keep procedural motion params)
           const isEmotionParam = param.startsWith('Param') && !param.startsWith('ParamAngle') && !param.startsWith('ParamBody') && !param.startsWith('ParamChest') && !param.startsWith('ParamHip') && !param.startsWith('ParamShoulder') && !param.startsWith('ParamBreath') && !param.startsWith('ParamMouthOpenY');
           const neutralVal = char.emotionMap['neutral'][param] ?? 0;
           const scaledTarget = isEmotionParam ? neutralVal + (rawTarget - neutralVal) * intensity : rawTarget;
@@ -571,15 +593,14 @@ function App() {
           coreModel.setParameterValueById('ParamMouthOpenY', 0);
         }
 
-        // 2. Continuous Breathing
-        const isSleep = activeEmotion === 'sleeping' || isSleepingRef.current;
-        const breathSpeed = isSleep ? 1.0 : currState === 'speaking' ? 3.5 : currState === 'listening' ? 2.5 : 2.0;
-        const breathAmp = isSleep ? 0.25 : currState === 'speaking' ? 0.6 : 0.4;
-        const breath = Math.sin(t * breathSpeed) * breathAmp + breathAmp * 0.5;
-        coreModel.setParameterValueById('ParamBreath', Math.max(0, breath));
+        // 2. Continuous Organic Breathing
+        const breathSpeed = isSleep ? 1.0 : currState === 'speaking' ? 3.0 : currState === 'listening' ? 2.4 : 1.8;
+        const breathAmp = isSleep ? 0.3 : currState === 'speaking' ? 0.65 : 0.45;
+        const breath = Math.sin(t * breathSpeed) * breathAmp + breathAmp * 0.55;
+        coreModel.setParameterValueById('ParamBreath', Math.max(0, Math.min(1.0, breath)));
 
         // 3. State-Specific Procedural Motions
-        const applySmoothed = (id: string, target: number, speed = 0.08) => {
+        const applySmoothed = (id: string, target: number, speed = 0.1) => {
           if (proceduralState[id] === undefined) proceduralState[id] = 0;
           proceduralState[id] += (target - proceduralState[id]) * speed;
           coreModel.setParameterValueById(id, proceduralState[id]);
@@ -594,44 +615,44 @@ function App() {
         let pShoulder = 0;
 
         if (isSleep) {
-          pAngleX = 2 + Math.sin(t * 0.8) * 1.5;
-          pAngleY = -5;
-          pAngleZ = -3 + Math.sin(t * 0.5) * 1.0;
-          pBodyAngleX = 1.0;
+          pAngleX = 2 + Math.sin(t * 0.8) * 2.0;
+          pAngleY = -6 + Math.cos(t * 0.6) * 1.5;
+          pAngleZ = -3 + Math.sin(t * 0.5) * 1.5;
+          pBodyAngleX = 1.0 + Math.sin(t * 0.7) * 0.5;
           pBodyAngleZ = -2.0;
           pShoulder = -0.15;
           coreModel.setParameterValueById('ParamEyeLOpen', 0);
           coreModel.setParameterValueById('ParamEyeROpen', 0);
         } else if (currState === 'speaking') {
-          // Micro-nod gesture: brief head dip on sentence boundaries
           const nodOffset = nodActiveRef.current ? nodTargetRef.current * Math.sin(nodPhaseRef.current * Math.PI) : 0;
           nodPhaseRef.current = Math.min(1, nodPhaseRef.current + dt * 4);
           if (!nodActiveRef.current) nodPhaseRef.current = 0;
 
-          // Excitement scales the speaking motion amplitude
-          const intensityScale = 0.7 + (emotionIntensityRef.current ?? 1.0) * 0.5;
-          pBodyAngleX = (Math.sin(t * 0.8) * 3.5 + Math.sin(t * 1.3) * 1.8 + c.smoothBodyX * 0.5) * intensityScale;
-          pBodyAngleZ = Math.sin(t * 0.6 + 1) * 2.5 * intensityScale;
-          pAngleX = (Math.sin(t * 1.2) * 3.5 + c.smoothAngleX * 0.6) * intensityScale + nodOffset;
-          pAngleY = (Math.sin(t * 1.5) * 4.5 + mouthEnergy * -3.5 + c.smoothAngleY * 0.6) * intensityScale;
-          pAngleZ = (Math.sin(t * 0.9 + 0.5) * 3.5 + c.smoothAngleZ * 0.6) * intensityScale;
-          pShoulder = mouthEnergy * 0.45 + Math.sin(t * 2) * 0.18;
+          const intensityScale = 0.8 + (emotionIntensityRef.current ?? 1.0) * 0.5;
+          pBodyAngleX = (Math.sin(t * 1.2) * 4.0 + Math.sin(t * 2.1) * 2.0 + c.smoothBodyX * 0.6) * intensityScale;
+          pBodyAngleZ = Math.sin(t * 1.0 + 1) * 3.0 * intensityScale;
+          pAngleX = (Math.sin(t * 1.6) * 4.5 + c.smoothAngleX * 0.7) * intensityScale + nodOffset;
+          pAngleY = (Math.sin(t * 1.8) * 5.0 + mouthEnergy * -4.0 + c.smoothAngleY * 0.7) * intensityScale;
+          pAngleZ = (Math.sin(t * 1.3 + 0.5) * 4.5 + c.smoothAngleZ * 0.7) * intensityScale;
+          pShoulder = mouthEnergy * 0.5 + Math.sin(t * 2.5) * 0.25;
         } else if (currState === 'listening') {
-          pAngleX = 12 + Math.sin(t * 0.5) * 3 + c.smoothAngleX * 0.6;
-          pAngleY = -8 + Math.sin(t * 0.7) * 2 + c.smoothAngleY * 0.6;
-          pAngleZ = Math.sin(t * 0.4) * 5 + c.smoothAngleZ * 0.6;
+          // Attentive listening posture: tilted head with curiosity
+          pAngleX = 10 + Math.sin(t * 1.2) * 2.5 + c.smoothAngleX * 0.7;
+          pAngleY = -6 + Math.sin(t * 1.5) * 2.0 + c.smoothAngleY * 0.7;
+          pAngleZ = 5 + Math.sin(t * 0.8) * 3.5 + c.smoothAngleZ * 0.7;
           pBodyAngleX = c.smoothBodyX * 0.7;
-          pBodyAngleZ = 6 + Math.sin(t * 0.6) * 2;
-          pShoulder = 0.25 + Math.sin(t * 0.6) * 0.1;
+          pBodyAngleZ = 5 + Math.sin(t * 1.0) * 2.0;
+          pShoulder = 0.3 + Math.sin(t * 1.2) * 0.15;
           coreModel.setParameterValueById('ParamEyeLOpen', 1.2);
           coreModel.setParameterValueById('ParamEyeROpen', 1.2);
         } else {
-          pBodyAngleX = Math.sin(t * 0.3) * 2.0 + Math.sin(t * 0.17) * 1.0 + c.smoothBodyX;
-          pBodyAngleZ = Math.sin(t * 0.25 + 1) * 1.5 + Math.tanh(-dx / 280) * 3;
-          pAngleX = Math.sin(t * 0.2) * 1.5 + c.smoothAngleX;
-          pAngleY = Math.sin(t * 0.15) * 1.5 + c.smoothAngleY;
-          pAngleZ = Math.sin(t * 0.2) * 2.0 + c.smoothAngleZ;
-          pShoulder = Math.sin(t * 2) * 0.1;
+          // Dynamic Idle Motion: organic sway, head movement, and breathing
+          pBodyAngleX = Math.sin(t * 1.2) * 3.0 + Math.sin(t * 0.7) * 1.8 + c.smoothBodyX;
+          pBodyAngleZ = Math.sin(t * 0.9 + 1) * 2.2 + Math.tanh(-dx / 280) * 3;
+          pAngleX = Math.sin(t * 1.4) * 4.0 + Math.sin(t * 0.6) * 2.0 + c.smoothAngleX;
+          pAngleY = Math.sin(t * 1.8) * 3.0 + Math.cos(t * 0.9) * 2.0 + c.smoothAngleY;
+          pAngleZ = Math.sin(t * 1.1) * 3.5 + c.smoothAngleZ;
+          pShoulder = Math.sin(t * 2) * 0.15;
         }
 
         // 4. Apply Procedural Rig Parameters
@@ -639,7 +660,7 @@ function App() {
         applySmoothed('ParamAngleY', pAngleY);
         applySmoothed('ParamAngleZ', pAngleZ);
         applySmoothed('ParamChestAngleX', pBodyAngleX * 0.8);
-        applySmoothed('ParamChestAngleY', (pAngleY * 0.3) + Math.sin(t * 2) * 0.2);
+        applySmoothed('ParamChestAngleY', (pAngleY * 0.3) + Math.sin(t * 2) * 0.3);
         applySmoothed('ParamBodyAngleX0', pBodyAngleX * 1.2);
         applySmoothed('ParamBodyAngleY0', pAngleY * 0.4);
         applySmoothed('ParamBodyAngleZ0', pBodyAngleZ * 1.1);
@@ -651,16 +672,18 @@ function App() {
         applySmoothed('ParamShoulderAngleY', pShoulder * 0.8);
 
         // Cat Tail & Ears Physics
-        const tailBase = currState === 'speaking' ? Math.sin(t * 2.2) * 0.6 + mouthEnergy * 0.4
-                       : currState === 'listening' ? Math.sin(t * 1.3) * 0.35
-                       : Math.sin(t * 0.8) * 0.25 + (pBodyAngleX * 0.05);
+        const tailBase = currState === 'speaking' ? Math.sin(t * 2.4) * 0.7 + mouthEnergy * 0.4
+                       : currState === 'listening' ? Math.sin(t * 1.8) * 0.5
+                       : Math.sin(t * 1.4) * 0.45 + (pBodyAngleX * 0.08);
         applySmoothed('Param_Angle_Rotation_1_ArtMesh220', tailBase);
 
-        const earTwitchL = Math.sin(t * 2.5) * 0.15 * (currState === 'speaking' ? (0.5 + mouthEnergy) : 0.4);
-        const earTwitchR = Math.sin(t * 2.5 + 1.5) * 0.15 * (currState === 'speaking' ? (0.5 + mouthEnergy) : 0.4);
+        // Ear twitches: natural occasional rapid twitch
+        const earNoise = Math.sin(t * 0.5) > 0.85 ? Math.sin(t * 16) * 0.4 : 0;
+        const earTwitchL = (Math.sin(t * 2.2) * 0.18 + earNoise) * (currState === 'speaking' ? (0.6 + mouthEnergy) : 0.5);
+        const earTwitchR = (Math.sin(t * 2.2 + 1.2) * 0.18 + earNoise) * (currState === 'speaking' ? (0.6 + mouthEnergy) : 0.5);
         applySmoothed('Ear_SR1', earTwitchR);
         applySmoothed('Ear_SL1', earTwitchL);
-        if (currState === 'listening') applySmoothed('Ear_smile', 0.7);
+        if (currState === 'listening') applySmoothed('Ear_smile', 0.85);
 
         if (modelRef.current) {
           try { modelRef.current.focus(cursorPosRef.current.x, cursorPosRef.current.y); } catch {}
@@ -685,7 +708,10 @@ function App() {
       }
       stopCurrentSpeech();
       if (appRef.current) {
-        try { appRef.current.destroy(true, { children: true, texture: true, baseTexture: true }); } catch {}
+        try {
+          appRef.current.ticker.stop();
+          appRef.current.destroy(true, { children: true, texture: true, baseTexture: true });
+        } catch {}
         appRef.current = null;
         modelRef.current = null;
       }

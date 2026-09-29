@@ -1,21 +1,20 @@
 """
-memory/fast_extractor.py — Ultra-fast local NER-based memory extraction for Friday 2.0.
-Uses spaCy for near-zero-latency entity extraction (no API calls).
-Falls back gracefully if spaCy is not installed.
-Complements the existing LLM extractor: handles ~80% of cases in <5ms.
+memory/fast_extractor.py — Ultra-fast, lightweight rule & regex memory extraction for Friday 2.0.
+100% Python standard library (re, datetime).
+Zero heavy dependencies, 0MB RAM overhead, sub-millisecond execution.
+Complements the cloud LLM extractor: handles common extraction cases instantly with 0 CPU impact.
 """
 import re
 import datetime
 from typing import List, Dict, Any
 
-_nlp = None
-_available = False
-
 _MONTHS = r"(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)"
+
 _DATE_PATTERNS = [
     re.compile(r'\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b'),
-    re.compile(rf'\b({_MONTHS})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b', re.I),
-    re.compile(rf'\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({_MONTHS}),?\s+(\d{{4}})\b', re.I),
+    re.compile(rf'\b({_MONTHS})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s*(\d{{4}})?\b', re.I),
+    re.compile(rf'\b(\d{{1,2}})(?:st|nd|rd|th)?\s+(?:of\s+)?({_MONTHS}),?\s*(\d{{4}})?\b', re.I),
+    re.compile(r'\b(?:tomorrow|next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month))\b', re.I),
 ]
 
 _PREFERENCE_PATTERNS = [
@@ -32,43 +31,32 @@ _REMEMBER_PATTERNS = [
     re.compile(r"(?:remember|note|save|don't forget)(?:\s+that)?\s+(.+?)(?:\.|$)", re.I),
 ]
 
-
-def _init_spacy():
-    global _nlp, _available
-    try:
-        import spacy
-        try:
-            _nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            from spacy.cli import download
-            download("en_core_web_sm")
-            _nlp = spacy.load("en_core_web_sm")
-        _available = True
-        print("[FastExtractor] spaCy en_core_web_sm loaded — fast NER active.")
-    except ImportError:
-        print("[FastExtractor] spaCy not installed — fast extraction disabled.")
-    except Exception as e:
-        print(f"[FastExtractor] spaCy init failed: {e}")
+_CONTACT_PATTERNS = [
+    re.compile(r"(?:my\s+(?:friend|colleague|brother|sister|mother|father|boss|manager|partner))\s+([A-Z][a-z]+)", re.I),
+    re.compile(r"(?:reach|contact|email|call)\s+([A-Z][a-z]+)\s+at\s+([^\s,]+)", re.I),
+]
 
 
 def extract_fast(text: str) -> List[Dict[str, Any]]:
     """
-    Fast, local memory extraction. Returns same schema as LLM extractor:
+    Fast, local, zero-dependency memory extraction.
+    Returns schema:
     [{"category": str, "key": str, "value": str, "date_time": str|None, "context": str}]
     """
-    results = []
+    results: List[Dict[str, Any]] = []
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
     clean = text.strip()
     if not clean or len(clean) < 4:
         return []
 
-    # 1. Name detection
+    # 1. Identity / Name detection
     for pat in _NAME_PATTERNS:
         m = pat.search(clean)
         if m:
             name = m.group(1).strip()
-            if 2 <= len(name) <= 60:
+            if 2 <= len(name) <= 60 and name.lower() not in ("sylphya", "friday", "sir", "here", "ready"):
                 results.append({"category": "identity", "key": "name", "value": name, "date_time": None, "context": clean})
+                break
 
     # 2. Preferences
     for pat in _PREFERENCE_PATTERNS:
@@ -77,8 +65,9 @@ def extract_fast(text: str) -> List[Dict[str, Any]]:
             groups = [g for g in m.groups() if g]
             value = " ".join(groups).strip()
             if 2 <= len(value) <= 200:
-                key = re.sub(r'\s+', '_', value[:40].lower())
-                results.append({"category": "preference", "key": key, "value": value, "date_time": None, "context": clean})
+                key = re.sub(r'[\s\W]+', '_', value[:40].lower()).strip('_')
+                if key:
+                    results.append({"category": "preference", "key": key, "value": value, "date_time": None, "context": clean})
 
     # 3. Explicit remember/note requests
     for pat in _REMEMBER_PATTERNS:
@@ -86,26 +75,29 @@ def extract_fast(text: str) -> List[Dict[str, Any]]:
         if m:
             value = m.group(1).strip()
             if 2 <= len(value) <= 300:
-                key = re.sub(r'\s+', '_', value[:40].lower())
-                results.append({"category": "fact", "key": key, "value": value, "date_time": today_str, "context": clean})
+                key = re.sub(r'[\s\W]+', '_', value[:40].lower()).strip('_')
+                if key:
+                    results.append({"category": "fact", "key": key, "value": value, "date_time": today_str, "context": clean})
 
-    # 4. spaCy NER for PERSON, ORG, DATE, TIME, GPE
-    if not _available and _nlp is None:
-        _init_spacy()
-    if _available and _nlp:
-        try:
-            doc = _nlp(clean)
-            for ent in doc.ents:
-                if ent.label_ == "PERSON":
-                    results.append({"category": "contact", "key": ent.text.lower().replace(" ", "_"), "value": ent.text, "date_time": None, "context": clean})
-                elif ent.label_ == "DATE" and len(ent.text) > 3:
-                    results.append({"category": "schedule", "key": re.sub(r'\s+', '_', ent.text[:40].lower()), "value": clean, "date_time": ent.text, "context": clean})
-                elif ent.label_ == "ORG" and len(ent.text) > 2:
-                    results.append({"category": "fact", "key": f"organization_{ent.text.lower().replace(' ', '_')[:30]}", "value": ent.text, "date_time": None, "context": clean})
-        except Exception:
-            pass
+    # 4. Schedule / Dates detection
+    for pat in _DATE_PATTERNS:
+        m = pat.search(clean)
+        if m:
+            date_match = m.group(0).strip()
+            key = f"event_{re.sub(r'[\s\W]+', '_', date_match.lower()).strip('_')}"
+            results.append({"category": "schedule", "key": key, "value": clean, "date_time": date_match, "context": clean})
+            break
 
-    # Deduplicate results
+    # 5. Contact detection
+    for pat in _CONTACT_PATTERNS:
+        m = pat.search(clean)
+        if m:
+            contact_name = m.group(1).strip()
+            contact_val = clean if len(m.groups()) < 2 else f"{contact_name}: {m.group(2)}"
+            key = f"contact_{re.sub(r'[\s\W]+', '_', contact_name.lower()).strip('_')}"
+            results.append({"category": "contact", "key": key, "value": contact_val, "date_time": None, "context": clean})
+
+    # Deduplicate results by key
     seen = set()
     deduped = []
     for r in results:
@@ -117,6 +109,5 @@ def extract_fast(text: str) -> List[Dict[str, Any]]:
 
 
 def is_available() -> bool:
-    if not _available:
-        _init_spacy()
-    return _available
+    """Fast regex extractor is always available with 0 dependencies."""
+    return True

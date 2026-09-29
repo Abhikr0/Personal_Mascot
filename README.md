@@ -9,7 +9,6 @@ Friday 2.0 is an interactive, animated AI desktop companion powered by Live2D, m
 ```
 Friday2.0/
 ├── main.py                 # FastAPI backend orchestrator & WebSocket server
-├── gui.py                  # CustomTkinter & pystray system tray desktop integration
 ├── backend.spec            # PyInstaller build specification
 ├── requirements.txt        # Python backend dependencies
 ├── .env.example            # Environment configuration template

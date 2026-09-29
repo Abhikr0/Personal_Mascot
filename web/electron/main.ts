@@ -131,13 +131,13 @@ function startPythonBackend(): Promise<void> {
         });
       }, 500);
 
-      // Timeout after 15 seconds
+      // Timeout after 30 seconds
       const timeoutId = setTimeout(() => {
         if (!isReady) {
           clearInterval(checkHealth);
           reject(new Error("Python backend took too long to start"));
         }
-      }, 15000);
+      }, 30000);
     }
   });
 }

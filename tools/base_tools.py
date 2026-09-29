@@ -161,29 +161,47 @@ def take_screenshot() -> str:
 def open_application(app_name: str) -> str:
     """Open an application on the desktop. Use this when the user asks you to open an app like Notepad, Chrome, Calculator, VS Code, Spotify, etc."""
     try:
+        clean_name = app_name.lower().strip()
+        # Web services that should open in the browser
+        web_services = {
+            "youtube": "https://www.youtube.com",
+            "google": "https://www.google.com",
+            "github": "https://www.github.com",
+            "gmail": "https://mail.google.com",
+            "chatgpt": "https://chatgpt.com",
+            "twitter": "https://www.twitter.com",
+            "x": "https://www.x.com",
+            "reddit": "https://www.reddit.com",
+            "netflix": "https://www.netflix.com",
+        }
+        if clean_name in web_services:
+            webbrowser.open(web_services[clean_name])
+            return f"Opened {app_name} in your browser, Sir."
+
         app_map = {
             "notepad": "notepad.exe",
             "calculator": "calc.exe",
             "calc": "calc.exe",
-            "chrome": "chrome",
-            "google chrome": "chrome",
+            "chrome": "start chrome",
+            "google chrome": "start chrome",
+            "edge": "start msedge",
             "explorer": "explorer.exe",
             "file explorer": "explorer.exe",
             "paint": "mspaint.exe",
-            "cmd": "cmd.exe",
-            "terminal": "wt.exe",
+            "cmd": "start cmd.exe",
+            "terminal": "start wt.exe",
             "task manager": "taskmgr.exe",
             "vscode": "code",
             "code": "code",
-            "spotify": "spotify",
-            "discord": "discord",
-            "powershell": "powershell.exe",
+            "spotify": "start spotify:",
+            "discord": "start discord:",
+            "powershell": "start powershell.exe",
             "settings": "start ms-settings:",
-            "word": "winword.exe",
-            "excel": "excel.exe",
+            "word": "start winword.exe",
+            "excel": "start excel.exe",
         }
         
-        exe = app_map.get(app_name.lower().strip(), app_name)
+        exe = app_map.get(clean_name, f"start {app_name}")
         subprocess.Popen(exe, shell=True)
         return f"Opened {app_name}, Sir."
     except Exception as e:

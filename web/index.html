@@ -9,7 +9,12 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-    <script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+    <script src="/live2dcubismcore.min.js"></script>
+    <script>
+      if (!window.Live2DCubismCore && typeof Live2DCubismCore !== 'undefined') {
+        window.Live2DCubismCore = Live2DCubismCore;
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
