@@ -104,7 +104,7 @@ def extract_text(content) -> str:
     if isinstance(content, list): return "".join(p.get("text", "") if isinstance(p, dict) else str(getattr(p, "text", p)) for p in content).strip()
     return str(content).strip()
 
-MISTRAL_MODELS = ["mistral-small-latest", "ministral-8b-latest", "ministral-3b-latest", "codestral-latest"]
+MISTRAL_MODELS = ["ministral-3b-latest", "open-mistral-nemo", "ministral-8b-latest", "mistral-small-latest", "codestral-latest"]
 GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
 _agent_pool = {}
 
@@ -156,7 +156,7 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm")
                 file=(filename, audio_bytes),
                 model="whisper-large-v3-turbo",
                 temperature=0.0,
-                prompt="Indian English and British English accents. Hey Sylphya, Sylphya, Friday, Sir, YouTube, songs, music, Chalte Rahu, Big Scratch."
+                prompt="Hey Sylphya, Friday, Sir."
             )
             text = transcription.text.strip()
             t1 = time.time()
@@ -328,18 +328,20 @@ async def chat_with_friday(req: ChatRequest):
                     tool_records.append({"name": tool_name, "args": tool_args, "result": tool_result})
                     print(f"[TOOL EXECUTED] {tool_name}({tool_args}) -> {tool_result[:80]}")
         
-        # Fast Edge-TTS
+        # Fast In-Memory Edge-TTS
         file_name = f"reply_{int(time.time())}.mp3"
         file_path = os.path.join(public_audio_dir, file_name)
         clean_tts_text = re.sub(r'[*_#`~]', '', reply_text)
         t0 = time.time()
-        await edge_tts.Communicate(clean_tts_text, "en-GB-SoniaNeural", rate="+25%").save(file_path)
+        communicate = edge_tts.Communicate(clean_tts_text, "en-GB-SoniaNeural", rate="+25%")
+        audio_chunks = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_chunks.extend(chunk["data"])
         t_tts = time.time() - t0
-        print(f"[AUDIO:Edge-TTS] Generated {file_name} in {t_tts:.3f}s")
-        
-        with open(file_path, "rb") as af:
-            audio_b64 = base64.b64encode(af.read()).decode("utf-8")
-        
+        print(f"[AUDIO:Edge-TTS] Streamed {file_name} in {t_tts:.3f}s")
+        audio_b64 = base64.b64encode(audio_chunks).decode("utf-8")
+        asyncio.create_task(asyncio.to_thread(lambda: open(file_path, "wb").write(audio_chunks)))
         t_total = t_tts
         
         # Log interaction for ML self-improvement

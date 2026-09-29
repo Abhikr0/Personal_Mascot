@@ -5,6 +5,7 @@ import './index.css';
 
 // Register PIXI on window and register Ticker for pixi-live2d-display
 (window as any).PIXI = PIXI;
+PIXI.utils.skipHello();
 Live2DModel.registerTicker(PIXI.Ticker);
 
 import {
@@ -843,8 +844,8 @@ function App() {
 
       let silentFrames = 0;
       let hasSpoken = false;
-      const SILENCE_THRESHOLD = 15;
-      const SILENCE_FRAMES_TO_STOP = 7;
+      const SILENCE_THRESHOLD = 14;
+      const SILENCE_FRAMES_TO_STOP = 4;
 
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) audioChunks.push(e.data);
@@ -955,7 +956,7 @@ function App() {
             if (mediaRecorder.state === 'recording') mediaRecorder.stop();
           }
         }
-      }, 100);
+      }, 80);
 
       setTimeout(() => {
         clearInterval(vadInterval);
@@ -1095,38 +1096,34 @@ function App() {
   // Status & Mode Styling Config
   const toggleTheme = isSleeping
     ? {
-        bg: 'rgba(99, 102, 241, 0.25)',
+        bg: 'rgba(99, 102, 241, 0.3)',
         border: 'rgba(129, 140, 248, 0.6)',
-        color: '#a5b4fc',
         dot: '#818cf8',
-        glow: 'rgba(99, 102, 241, 0.35)',
-        label: '💤 Sleeping',
+        glow: 'rgba(99, 102, 241, 0.5)',
+        label: 'Sleeping (Tap mascot to wake)',
       }
     : isAlwaysOn
       ? isInActiveWindow
         ? {
-            bg: 'rgba(59, 130, 246, 0.25)',
+            bg: 'rgba(59, 130, 246, 0.3)',
             border: 'rgba(96, 165, 250, 0.6)',
-            color: '#93c5fd',
             dot: '#60a5fa',
-            glow: 'rgba(59, 130, 246, 0.35)',
-            label: 'Active Chat 💬',
+            glow: 'rgba(59, 130, 246, 0.5)',
+            label: 'Active Chat Mode',
           }
         : {
-            bg: 'rgba(34, 197, 94, 0.22)',
+            bg: 'rgba(34, 197, 94, 0.25)',
             border: 'rgba(74, 222, 128, 0.6)',
-            color: '#4ade80',
             dot: '#22c55e',
-            glow: 'rgba(34, 197, 94, 0.35)',
-            label: 'Hey Sylphya 👂',
+            glow: 'rgba(34, 197, 94, 0.5)',
+            label: 'Always-On (Say "Hey Sylphya")',
           }
       : {
-          bg: 'rgba(20, 20, 32, 0.75)',
-          border: 'rgba(255, 255, 255, 0.14)',
-          color: '#9ca3af',
-          dot: '#6b7280',
-          glow: 'rgba(0, 0, 0, 0.4)',
-          label: 'Push to Talk 🎙️',
+          bg: 'rgba(255, 255, 255, 0.08)',
+          border: 'rgba(255, 255, 255, 0.2)',
+          dot: '#9ca3af',
+          glow: 'rgba(255, 255, 255, 0.2)',
+          label: 'Push-to-Talk (Ctrl+Space or tap mascot)',
         };
 
   return (
@@ -1144,49 +1141,44 @@ function App() {
         </div>
       )}
 
-      {/* Always-On / Wake Word Mode Toggle (Top-Left) */}
+      {/* Minimal Mode Indicator Dot (Zero text, bottom-left) */}
       <div
-        className="interactive always-on-toggle"
+        className={`interactive always-on-toggle ${isAlwaysOn || isSleeping || listenState === 'listening' ? 'active' : ''}`}
         onClick={(e) => {
           e.stopPropagation();
           toggleAlwaysOn();
         }}
-        title="Toggle Always-On / Wake Word Mode (Ctrl+Shift+A)"
+        title={`${toggleTheme.label} • Click to toggle Always-On / Wake Word mode (Ctrl+Shift+A)`}
         style={{
           position: 'absolute',
-          top: 14,
-          left: 14,
+          bottom: 12,
+          left: 12,
+          width: '14px',
+          height: '14px',
           display: 'flex',
           alignItems: 'center',
-          gap: '7px',
-          padding: '5px 12px',
-          borderRadius: '16px',
+          justifyContent: 'center',
+          borderRadius: '50%',
           background: toggleTheme.bg,
           border: `1px solid ${toggleTheme.border}`,
-          backdropFilter: 'blur(16px)',
-          WebkitBackdropFilter: 'blur(16px)',
-          color: toggleTheme.color,
-          fontSize: '11px',
-          fontWeight: 600,
-          letterSpacing: '0.3px',
+          backdropFilter: 'blur(12px)',
+          WebkitBackdropFilter: 'blur(12px)',
           cursor: 'pointer',
           userSelect: 'none',
           zIndex: 80,
-          transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
-          boxShadow: isAlwaysOn || isSleeping ? `0 0 14px ${toggleTheme.glow}` : `0 2px 8px ${toggleTheme.glow}`,
+          boxShadow: `0 0 6px ${toggleTheme.glow}`,
         }}
       >
         <span
           style={{
-            width: '8px',
-            height: '8px',
+            width: '6px',
+            height: '6px',
             borderRadius: '50%',
-            backgroundColor: toggleTheme.dot,
-            boxShadow: isAlwaysOn || isSleeping ? `0 0 8px ${toggleTheme.dot}` : 'none',
-            animation: !isSleeping && isAlwaysOn && listenState === 'listening' ? 'pulse 1.2s infinite' : 'none',
+            backgroundColor: listenState === 'listening' ? '#ef4444' : toggleTheme.dot,
+            boxShadow: `0 0 6px ${listenState === 'listening' ? '#ef4444' : toggleTheme.dot}`,
+            animation: !isSleeping && (isAlwaysOn || listenState === 'listening') ? 'pulse 1.2s infinite' : 'none',
           }}
         />
-        {toggleTheme.label}
       </div>
 
       {/* Discreet Audio Status Indicators (Top-Right) */}

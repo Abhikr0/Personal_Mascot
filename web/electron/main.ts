@@ -7,6 +7,8 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+process.env['ELECTRON_DISABLE_SECURITY_WARNINGS'] = 'true';
+
 let mainWindow: BrowserWindow | null = null;
 let pythonProcess: ChildProcess | null = null;
 
@@ -66,10 +68,6 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
-
-  mainWindow.webContents.on('console-message', (_event, _level, message, line, sourceId) => {
-    console.log(`[Renderer]: ${message} (${sourceId}:${line})`);
-  });
 
   // Prevent white flashes on load
   mainWindow.on('ready-to-show', () => {

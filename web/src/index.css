@@ -503,3 +503,22 @@ button, input, .canvas-container, .canvas-wrapper {
   }
 }
 
+/* ── Discreet Push-to-Talk / Always-On Indicator Dot (Bottom) ── */
+.always-on-toggle {
+  opacity: 0.35;
+  transition: opacity 0.25s ease, transform 0.2s ease, box-shadow 0.25s ease;
+}
+
+.always-on-toggle:hover {
+  opacity: 1 !important;
+  transform: scale(1.25);
+}
+
+.always-on-toggle.active {
+  opacity: 0.9;
+}
+
+.always-on-toggle:active {
+  transform: scale(0.9);
+}
+
