@@ -3,9 +3,6 @@ import json
 import datetime
 from typing import List, Dict, Any
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_mistralai import ChatMistralAI
-from langchain_core.messages import SystemMessage, HumanMessage
 
 load_dotenv(override=True)
 
@@ -14,23 +11,58 @@ Ignore transient commands, small talk, and temporary questions. Return [] if non
 Return JSON array: [{"category": "identity|schedule|preference|contact|fact", "key": "short_key", "value": "info", "date_time": "date/time or null"}]"""
 
 
-
 class MemoryExtractor:
     def __init__(self):
+        pass
+
+    def _call_llm(self, prompt: str) -> str:
+        # 1. Try Mistral
         mistral_key = os.getenv("MISTRAL_API_KEY")
         if mistral_key:
-            self.llm = ChatMistralAI(
+            from mistralai.client import Mistral
+            client = Mistral(api_key=mistral_key)
+            resp = client.chat.complete(
                 model="open-mistral-nemo",
-                api_key=mistral_key,
+                messages=[
+                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
                 temperature=0.0
             )
-        else:
-            api_key = os.getenv("GEMINI_API_KEY")
-            self.llm = ChatGoogleGenerativeAI(
+            return resp.choices[0].message.content or ""
+
+        # 2. Try Gemini
+        gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if gemini_key:
+            from google import genai
+            from google.genai import types
+            client = genai.Client(api_key=gemini_key)
+            resp = client.models.generate_content(
                 model="gemini-flash-lite-latest",
-                google_api_key=api_key,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=EXTRACTION_SYSTEM_PROMPT,
+                    temperature=0.0
+                )
+            )
+            return resp.text or ""
+
+        # 3. Try Groq
+        groq_key = os.getenv("GROQ_API_KEY")
+        if groq_key:
+            from groq import Groq
+            client = Groq(api_key=groq_key)
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
                 temperature=0.0
             )
+            return resp.choices[0].message.content or ""
+
+        return ""
 
     def extract_entities(self, text: str) -> List[Dict[str, Any]]:
         """Analyze text and extract structured memory entities. Returns empty list if nothing durable."""
@@ -54,17 +86,10 @@ class MemoryExtractor:
         try:
             today_str = datetime.datetime.now().strftime("%Y-%m-%d")
             user_prompt = f"Date: {today_str}\nText: {clean_text}"
-            
-            messages = [
-                SystemMessage(content=EXTRACTION_SYSTEM_PROMPT),
-                HumanMessage(content=user_prompt)
-            ]
-            
-            response = self.llm.invoke(messages)
-            raw = response.content
-            if isinstance(raw, list):
-                raw = "".join([part.get("text", "") if isinstance(part, dict) else str(part) for part in raw])
-            raw = str(raw).strip()
+
+            raw = self._call_llm(user_prompt).strip()
+            if not raw:
+                return []
 
             # Clean markdown code blocks
             if "```json" in raw:

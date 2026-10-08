@@ -4,7 +4,7 @@ Provides active window detection, desktop notifications, and clipboard access.
 """
 import sys
 import subprocess
-from langchain_core.tools import tool
+from .decorator import tool
 
 
 @tool

@@ -21,17 +21,13 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, W
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import speech_recognition as sr
 from dotenv import load_dotenv
 import edge_tts
 from groq import Groq
 
-# LangChain + LangGraph imports
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_mistralai import ChatMistralAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_core.tools import tool
-from langchain.agents import create_agent
+# Native Agent Runner imports (Zero LangChain / LangGraph)
+from agent_runner import SystemMessage, HumanMessage, AIMessage, ChatMessage, execute_agent_turn
+
 
 load_dotenv(override=True)
 
@@ -106,28 +102,22 @@ def extract_text(content) -> str:
 
 MISTRAL_MODELS = ["ministral-3b-latest", "open-mistral-nemo", "ministral-8b-latest", "mistral-small-latest", "codestral-latest"]
 GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
-_agent_pool = {}
+GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
-def get_or_create_agent(provider: str, model_name: str):
-    cache_key = f"{provider}:{model_name}"
-    if cache_key not in _agent_pool:
-        llm = ChatMistralAI(model=model_name, api_key=os.getenv("MISTRAL_API_KEY"), temperature=0.7, max_tokens=100) if provider == "mistral" else ChatGoogleGenerativeAI(model=model_name, google_api_key=os.getenv("GEMINI_API_KEY"), max_output_tokens=100)
-        _agent_pool[cache_key] = create_agent(llm, tools)
-    return _agent_pool[cache_key]
-
-# Build candidate priority list (Mistral models first, then Gemini models)
+# Build candidate priority list (Mistral models first, then Gemini models, then Groq models)
 CANDIDATE_MODEL_CONFIGS = []
 if os.getenv("MISTRAL_API_KEY"):
     for m in MISTRAL_MODELS:
         CANDIDATE_MODEL_CONFIGS.append(("mistral", m))
 
-if os.getenv("GEMINI_API_KEY"):
+if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
     for m in GEMINI_MODELS:
         CANDIDATE_MODEL_CONFIGS.append(("gemini", m))
 
-# Warm up primary agent
-primary_provider, primary_model = CANDIDATE_MODEL_CONFIGS[0] if CANDIDATE_MODEL_CONFIGS else ("gemini", "gemini-flash-lite-latest")
-agent = get_or_create_agent(primary_provider, primary_model)
+if os.getenv("GROQ_API_KEY"):
+    for m in GROQ_MODELS:
+        CANDIDATE_MODEL_CONFIGS.append(("groq", m))
+
 
 # Singleton Groq client for low-latency STT
 _groq_client = None
@@ -166,37 +156,41 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm")
         except Exception as ge:
             print(f"[STT:Groq] Fallback ({ge})")
 
-    # 2. Basic Fallback: Google Speech Recognition (free, 0 local weights, 0 CPU hogging)
+    # 2. Basic Fallback: Google Speech Recognition via direct REST API (zero extra packages)
     temp_dir = tempfile.gettempdir()
     temp_in = os.path.join(temp_dir, f"in_{int(time.time())}_{filename}")
     temp_wav = os.path.join(temp_dir, f"out_{int(time.time())}.wav")
     try:
         with open(temp_in, "wb") as f:
             f.write(audio_bytes)
-        if filename.lower().endswith(".wav"):
-            target_wav = temp_in
-        else:
-            target_wav = temp_wav
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", temp_in, "-ar", "16000", "-ac", "1", temp_wav],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        recognizer = sr.Recognizer()
-        text = ""
-        if os.path.exists(target_wav):
-            with sr.AudioFile(target_wav) as source:
-                audio_data = recognizer.record(source)
+        target_wav = temp_in if filename.lower().endswith(".wav") else temp_wav
+        if target_wav != temp_in:
             try:
-                t0 = time.time()
-                text = recognizer.recognize_google(audio_data)
-                t1 = time.time()
-                print(f"[STT:Google] Transcribed in {t1 - t0:.3f}s: \"{text}\"")
-                return text
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", temp_in, "-ar", "16000", "-ac", "1", temp_wav],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
             except Exception:
                 pass
+        if os.path.exists(target_wav):
+            import httpx
+            with open(target_wav, "rb") as af:
+                wav_data = af.read()
+            url = "https://www.google.com/speech-api/v2/recognize?client=chromium&lang=en-US&maxresults=1"
+            headers = {"Content-Type": "audio/l16; rate=16000"}
+            resp = httpx.post(url, content=wav_data, headers=headers, timeout=6.0)
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    if line.strip():
+                        parsed = json.loads(line)
+                        results = parsed.get("result", [])
+                        if results and "alternative" in results[0]:
+                            alt = results[0]["alternative"][0].get("transcript", "").strip()
+                            if alt:
+                                return alt
     except Exception as e:
-        print(f"[STT:Google] Error: {e}")
+        print(f"[STT:Fallback] Note: {e}. Set GROQ_API_KEY in .env for sub-second Whisper transcription.")
     finally:
         for p in [temp_in, temp_wav]:
             if os.path.exists(p):
@@ -266,25 +260,32 @@ async def chat_with_friday(req: ChatRequest):
             agent_messages.extend(chat_history)
             agent_messages.append(HumanMessage(content=message))
             
-            # Run the LangGraph agent with multi-model fallback (Mistral primary)
+            # Run the native ReAct agent with multi-model fallback (Mistral -> Gemini -> Groq)
             result = None
             last_agent_error = None
 
-            for provider, candidate_model in CANDIDATE_MODEL_CONFIGS:
-                try:
-                    print(f"[AGENT] Running with {provider} model: {candidate_model}...")
-                    current_agent = get_or_create_agent(provider, candidate_model)
-                    result = await asyncio.to_thread(
-                        current_agent.invoke,
-                        {"messages": agent_messages}
-                    )
-                    print(f"[AGENT] Successfully completed with {provider}:{candidate_model}")
-                    break
-                except Exception as model_err:
-                    err_text = str(model_err)
-                    last_agent_error = model_err
-                    print(f"[AGENT FALLBACK] {provider}:{candidate_model} error: {err_text[:140]}")
-                    continue
+            if not CANDIDATE_MODEL_CONFIGS:
+                reply_text = "Please set MISTRAL_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env."
+                reply_emotion = "concerned"
+                result = {"messages": [AIMessage(content=json.dumps({"text": reply_text, "emotion": reply_emotion, "intensity": 0.8}))]}
+            else:
+                for provider, candidate_model in CANDIDATE_MODEL_CONFIGS:
+                    try:
+                        print(f"[AGENT] Running with {provider} model: {candidate_model}...")
+                        result = await asyncio.to_thread(
+                            execute_agent_turn,
+                            agent_messages,
+                            provider,
+                            candidate_model,
+                            tools
+                        )
+                        print(f"[AGENT] Successfully completed with {provider}:{candidate_model}")
+                        break
+                    except Exception as model_err:
+                        err_text = str(model_err)
+                        last_agent_error = model_err
+                        print(f"[AGENT FALLBACK] {provider}:{candidate_model} error: {err_text[:140]}")
+                        continue
 
             if result is None:
                 if last_agent_error:
@@ -505,13 +506,23 @@ async def voice_websocket(websocket: WebSocket):
                         agent_messages = [SystemMessage(content=sys_prompt)] + chat_history[-10:] + [HumanMessage(content=user_text)]
                         
                         result = None
-                        for provider, candidate_model in CANDIDATE_MODEL_CONFIGS:
-                            try:
-                                current_agent = get_or_create_agent(provider, candidate_model)
-                                result = await asyncio.to_thread(current_agent.invoke, {"messages": agent_messages})
-                                break
-                            except Exception:
-                                continue
+                        if not CANDIDATE_MODEL_CONFIGS:
+                            reply_text = "Please set MISTRAL_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env."
+                            reply_emotion = "concerned"
+                            result = {"messages": [AIMessage(content=json.dumps({"text": reply_text, "emotion": reply_emotion}))]}
+                        else:
+                            for provider, candidate_model in CANDIDATE_MODEL_CONFIGS:
+                                try:
+                                    result = await asyncio.to_thread(
+                                        execute_agent_turn,
+                                        agent_messages,
+                                        provider,
+                                        candidate_model,
+                                        tools
+                                    )
+                                    break
+                                except Exception:
+                                    continue
                         
                         reply_text = "I'm having a moment, Sir."
                         reply_emotion = "concerned"
@@ -625,7 +636,7 @@ def health_check():
     return {
         "status": "ok",
         "backend": "python",
-        "orchestration": "langgraph",
+        "orchestration": "native-react",
         "primary_llm": "mistral" if os.getenv("MISTRAL_API_KEY") else "gemini",
         "stt_engine": "groq_whisper_large_v3_turbo" if os.getenv("GROQ_API_KEY") else "local_faster_whisper",
         "tts_engine": "edge_tts_streaming",

@@ -1,7 +1,7 @@
 import os
 import sys
 import shutil
-from langchain_core.tools import tool
+from .decorator import tool
 
 # Determine base directory
 if getattr(sys, 'frozen', False):

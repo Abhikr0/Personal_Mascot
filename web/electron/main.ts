@@ -1,5 +1,6 @@
 import { app, BrowserWindow, screen, ipcMain, globalShortcut } from 'electron';
 import path from 'path';
+import fs from 'fs';
 import { spawn, ChildProcess } from 'child_process';
 import http from 'http';
 import { fileURLToPath } from 'url';
@@ -101,9 +102,18 @@ function startPythonBackend(): Promise<void> {
           env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
         });
       } else {
-        // Spawn python from the parent directory with UTF-8 encoding
-        pythonProcess = spawn('python', ['main.py'], {
-          cwd: path.join(__dirname, '../../'), // We are inside web/dist-electron (or web/), so go up one level to Friday2.0
+        const rootDir = path.resolve(__dirname, '../../');
+        const venvMac = path.join(rootDir, '.venv', 'bin', 'python');
+        const venvWin = path.join(rootDir, '.venv', 'Scripts', 'python.exe');
+        let pyExe = 'python3';
+        if (process.platform === 'win32') {
+          pyExe = fs.existsSync(venvWin) ? venvWin : 'python';
+        } else {
+          pyExe = fs.existsSync(venvMac) ? venvMac : 'python3';
+        }
+        console.log(`[Electron] Spawning python using: ${pyExe}`);
+        pythonProcess = spawn(pyExe, ['main.py'], {
+          cwd: rootDir,
           env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
         });
       }

@@ -1,19 +1,12 @@
 fastapi
-uvicorn[standard]
-websockets
+uvicorn
 python-multipart
 edge-tts
-SpeechRecognition
 python-dotenv
 groq
-langchain-google-genai
-langgraph
-langchain-core
-langchain-community
+google-genai
 duckduckgo-search
 pyautogui
-pywin32
+pywin32; sys_platform == 'win32'
 psutil
-pillow
 mistralai
-langchain-mistralai

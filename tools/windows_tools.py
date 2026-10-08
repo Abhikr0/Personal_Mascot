@@ -3,7 +3,7 @@ import time
 import ctypes
 import subprocess
 import psutil
-from langchain_core.tools import tool
+from .decorator import tool
 
 # Windows Virtual-Key Codes for Media & Volume
 VK_VOLUME_MUTE = 0xAD

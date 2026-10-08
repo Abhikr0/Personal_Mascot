@@ -1,6 +1,6 @@
 import time
 import pyautogui
-from langchain_core.tools import tool
+from .decorator import tool
 
 # Set PyAutoGUI failsafe and pause
 pyautogui.FAILSAFE = True

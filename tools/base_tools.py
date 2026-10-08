@@ -3,7 +3,7 @@ import sys
 import datetime
 import subprocess
 import webbrowser
-from langchain_core.tools import tool
+from .decorator import tool
 
 # Determine base directory
 if getattr(sys, 'frozen', False):
@@ -145,14 +145,35 @@ def open_website(target: str) -> str:
 def take_screenshot() -> str:
     """Take a screenshot of the user's screen and save it to the Pictures folder."""
     try:
-        from PIL import ImageGrab
         pictures_dir = os.path.join(os.path.expanduser("~"), "Pictures")
         os.makedirs(pictures_dir, exist_ok=True)
         filename = f"screenshot_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         filepath = os.path.join(pictures_dir, filename)
-        img = ImageGrab.grab()
-        img.save(filepath)
-        return f"Screenshot successfully saved to {filepath}"
+
+        if sys.platform == "darwin":
+            subprocess.run(["screencapture", "-x", filepath], check=True)
+            return f"Screenshot successfully saved to {filepath}"
+        elif sys.platform == "win32":
+            ps_cmd = (
+                f"Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
+                f"$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                f"$bmp = New-Object System.Drawing.Bitmap $bounds.width, $bounds.height; "
+                f"$g = [System.Drawing.Graphics]::FromImage($bmp); "
+                f"$g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.size); "
+                f"$bmp.Save('{filepath}', [System.Drawing.Imaging.ImageFormat]::Png); "
+                f"$g.Dispose(); $bmp.Dispose();"
+            )
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], check=True)
+            return f"Screenshot successfully saved to {filepath}"
+        else:
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab()
+                img.save(filepath)
+                return f"Screenshot successfully saved to {filepath}"
+            except Exception:
+                subprocess.run(["import", "-window", "root", filepath], check=True)
+                return f"Screenshot successfully saved to {filepath}"
     except Exception as e:
         return f"Failed to capture screenshot: {str(e)}"
 

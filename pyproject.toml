@@ -1,0 +1,23 @@
+[project]
+name = "personal-mascot"
+version = "0.1.0"
+description = "Personal Mascot Backend"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "duckduckgo-search>=8.1.1",
+    "edge-tts>=7.2.8",
+    "fastapi>=0.143.0",
+    "google-genai>=2.29.0",
+    "groq>=1.7.0",
+    "mistralai>=3.1.0",
+    "psutil>=7.2.2",
+    "pyautogui>=0.9.54",
+    "python-dotenv>=1.2.4",
+    "python-multipart>=0.0.32",
+    "pywin32>=312 ; sys_platform == 'win32'",
+    "uvicorn>=0.34.0",
+]
+
+[tool.uv]
+package = false

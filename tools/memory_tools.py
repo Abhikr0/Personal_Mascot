@@ -1,5 +1,5 @@
 from typing import Optional
-from langchain_core.tools import tool
+from .decorator import tool
 from memory import memory_db, remember_user_statement
 
 
