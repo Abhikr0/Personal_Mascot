@@ -21,12 +21,12 @@ const WIN_W = 440;
 const WIN_H = 540;
 
 // Wake Word & Intent Regex Patterns
-const WAKE_WORD_PATTERN = /^(?:(?:hey|hi|hello|ok|okay|yo|listen)\s+)?(?:sylphya|friday)\b[,:\s]*/i;
-const ANY_WAKE_WORD_PATTERN = /\b(?:sylphya|friday)\b/i;
-const WAKE_WORD_CLEAN_PATTERN = /\b(?:sylphya|friday)\b/gi;
-const GREETING_REGEX = /^(hi|hello|hey)(\s+(sylphya|friday|there))?$/i;
-const WAKE_COMMAND_REGEX = /^(?:(?:hey|hi)?\s*(?:sylphya|friday)[,:\s]*)?(?:wake\s*up|wake)\b/i;
-const SLEEP_COMMAND_REGEX = /^(?:(?:hey|hi|hello|ok)?\s*(?:sylphya|friday)[,:\s]*)?(?:(?:go\s+to\s+)?sleep|take\s+a\s+(?:nap|rest)|stop\s+listening|mute\s+yourself|good\s*night)\b/i;
+const WAKE_WORD_PATTERN = /^(?:(?:hey|hi|hello|ok|okay|yo|listen)\s+)?(?:sylphya|sylvia|silvia|sophia|sulphur|silfi|friday)\b[,:\s]*/i;
+const ANY_WAKE_WORD_PATTERN = /\b(?:sylphya|sylvia|silvia|sophia|sulphur|silfi|friday)\b/i;
+const WAKE_WORD_CLEAN_PATTERN = /\b(?:sylphya|sylvia|silvia|sophia|sulphur|silfi|friday)\b/gi;
+const GREETING_REGEX = /^(hi|hello|hey)(\s+(sylphya|sylvia|silvia|sophia|sulphur|friday|there))?$/i;
+const WAKE_COMMAND_REGEX = /^(?:(?:hey|hi)?\s*(?:sylphya|sylvia|silvia|sophia|sulphur|friday)[,:\s]*)?(?:wake\s*up|wake)\b/i;
+const SLEEP_COMMAND_REGEX = /^(?:(?:hey|hi|hello|ok)?\s*(?:sylphya|sylvia|silvia|sophia|sulphur|friday)[,:\s]*)?(?:(?:go\s+to\s+)?sleep|take\s+a\s+(?:nap|rest)|stop\s+listening|mute\s+yourself|good\s*night)\b/i;
 
 // Safe Electron IPC accessor
 function getElectronIpc() {
@@ -37,7 +37,7 @@ function getElectronIpc() {
     try {
       const electron = w.require('electron');
       return electron?.ipcRenderer || electron;
-    } catch {}
+    } catch { }
   }
   return null;
 }
@@ -114,7 +114,7 @@ function App() {
   const nodPhaseRef = useRef(0);
   const nodTargetRef = useRef(0);
   const nodActiveRef = useRef(false);
-  
+
   // Mathematical Tracking State (Origin: WIN_W / 2, 180)
   const cursorPosRef = useRef({
     x: Math.round(WIN_W / 2),
@@ -172,7 +172,7 @@ function App() {
     alwaysOnRef.current = isAlwaysOn;
     try {
       localStorage.setItem('sylphya_always_on', String(isAlwaysOn));
-    } catch {}
+    } catch { }
   }, [isAlwaysOn]);
 
   // Refreshes the 25-second active conversational follow-up window
@@ -207,7 +207,7 @@ function App() {
       if (currentAudioFilenameRef.current === filename) {
         currentAudioFilenameRef.current = null;
       }
-      fetch(`http://localhost:8000/api/audio/${filename}`, { method: 'DELETE' }).catch(() => {});
+      fetch(`http://localhost:8000/api/audio/${filename}`, { method: 'DELETE' }).catch(() => { });
     }
   }, []);
 
@@ -218,19 +218,19 @@ function App() {
       lipSyncFrameRef.current = null;
     }
     if (lipSyncSourceRef.current) {
-      try { lipSyncSourceRef.current.stop(); } catch {}
-      try { lipSyncSourceRef.current.disconnect(); } catch {}
+      try { lipSyncSourceRef.current.stop(); } catch { }
+      try { lipSyncSourceRef.current.disconnect(); } catch { }
       lipSyncSourceRef.current = null;
     }
     if (lipSyncAnalyserRef.current) {
-      try { lipSyncAnalyserRef.current.disconnect(); } catch {}
+      try { lipSyncAnalyserRef.current.disconnect(); } catch { }
       lipSyncAnalyserRef.current = null;
     }
     mouthOpenRef.current = 0;
     if (modelRef.current?.internalModel?.coreModel) {
       try {
         modelRef.current.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0);
-      } catch {}
+      } catch { }
     }
     deleteSpokenAudioFile();
   }, [deleteSpokenAudioFile]);
@@ -295,7 +295,7 @@ function App() {
           return true;
         }
       }
-    } catch {}
+    } catch { }
 
     const app = appRef.current;
     if (!app || !app.view) return false;
@@ -365,7 +365,7 @@ function App() {
       if (appRef.current) {
         try {
           appRef.current.destroy(true, { children: true });
-        } catch {}
+        } catch { }
         appRef.current = null;
       }
 
@@ -374,8 +374,8 @@ function App() {
         height: WIN_H,
         backgroundAlpha: 0,
         antialias: true,
-        resolution: 1,
-        autoDensity: false,
+        resolution: window.devicePixelRatio || 2,
+        autoDensity: true,
         preserveDrawingBuffer: true,
         sharedTicker: true,
       });
@@ -386,8 +386,8 @@ function App() {
       canvasRef.current.appendChild(app.view as unknown as HTMLElement);
       appRef.current = app;
 
-      const model = await Live2DModel.from(char.modelPath, { 
-        autoInteract: false, 
+      const model = await Live2DModel.from(char.modelPath, {
+        autoInteract: false,
         autoUpdate: true,
       } as any);
 
@@ -401,7 +401,7 @@ function App() {
       const baseWidth = (model as any).internalModel.width || model.width;
       const baseHeight = (model as any).internalModel.height || model.height;
       const scale = Math.min(WIN_W / baseWidth, WIN_H / baseHeight) * char.scaleMultiplier;
-      
+
       model.scale.set(scale);
       model.anchor.set(0.5, 0.5);
       model.x = WIN_W / 2 + char.offsetX;
@@ -604,8 +604,8 @@ function App() {
 
         // Cat Tail & Ears Physics
         const tailBase = currState === 'speaking' ? Math.sin(t * 2.4) * 0.7 + mouthEnergy * 0.4
-                       : currState === 'listening' ? Math.sin(t * 1.8) * 0.5
-                       : Math.sin(t * 1.4) * 0.45 + (pBodyAngleX * 0.08);
+          : currState === 'listening' ? Math.sin(t * 1.8) * 0.5
+            : Math.sin(t * 1.4) * 0.45 + (pBodyAngleX * 0.08);
         applySmoothed('Param_Angle_Rotation_1_ArtMesh220', tailBase);
 
         // Ear twitches: natural occasional rapid twitch
@@ -617,7 +617,7 @@ function App() {
         if (currState === 'listening') applySmoothed('Ear_smile', 0.85);
 
         if (modelRef.current) {
-          try { modelRef.current.focus(cursorPosRef.current.x, cursorPosRef.current.y); } catch {}
+          try { modelRef.current.focus(cursorPosRef.current.x, cursorPosRef.current.y); } catch { }
         }
       };
 
@@ -641,7 +641,7 @@ function App() {
       if (appRef.current) {
         try {
           appRef.current.destroy(true, { children: true, texture: true, baseTexture: true });
-        } catch {}
+        } catch { }
         appRef.current = null;
         modelRef.current = null;
       }
@@ -657,7 +657,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: lastReplyText, positive }),
       });
-    } catch {}
+    } catch { }
   }, [lastReplyText]);
 
   // --- Backend Chat, Edge-TTS Audio & Real-Time Lip Sync ---
@@ -843,9 +843,12 @@ function App() {
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
       let silentFrames = 0;
+      let speechFrames = 0;
       let hasSpoken = false;
-      const SILENCE_THRESHOLD = 14;
-      const SILENCE_FRAMES_TO_STOP = 4;
+      const SILENCE_THRESHOLD = 10;
+      const SILENCE_FRAMES_TO_STOP = alwaysOnRef.current ? 15 : 20; // 1.2s to 1.6s of silence before stopping
+
+      console.log(`[MIC] Started recording (Mode: ${alwaysOnRef.current ? 'Always-On' : 'Push-to-Talk'})`);
 
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) audioChunks.push(e.data);
@@ -853,10 +856,17 @@ function App() {
 
       mediaRecorder.onstop = async () => {
         stream.getTracks().forEach(t => t.stop());
-        try { audioContext.close(); } catch {}
+        try { audioContext.close(); } catch { }
         isRecordingRef.current = false;
 
-        if (audioChunks.length === 0 || !hasSpoken) {
+        const totalBytes = audioChunks.reduce((acc, c) => acc + c.size, 0);
+        console.log(`[MIC] Stopped. Chunks: ${audioChunks.length}, Total bytes: ${totalBytes}, Spoken frames: ${speechFrames}`);
+
+        // If manual push-to-talk was used or speech was detected, transcribe
+        const shouldTranscribe = audioChunks.length > 0 && (hasSpoken || !alwaysOnRef.current || totalBytes > 10000);
+
+        if (!shouldTranscribe) {
+          console.log('[MIC] Ignored: no speech activity detected.');
           setIdleState('neutral', 200);
           return;
         }
@@ -875,11 +885,14 @@ function App() {
             body: formData,
           });
 
-          if (!res.ok) throw new Error('Transcription failed');
+          if (!res.ok) throw new Error(`Transcription failed with HTTP ${res.status}`);
           const data = await res.json();
           const text = data.text?.trim();
 
+          console.log('[MIC] Transcribed result:', text ? `"${text}"` : '<empty>');
+
           if (text && text.length > 0) {
+            showSubtitle(text, 2500);
             const now = Date.now();
             const hasWakeWord = ANY_WAKE_WORD_PATTERN.test(text);
             const isWakeCommand = WAKE_COMMAND_REGEX.test(text);
@@ -928,14 +941,15 @@ function App() {
               refreshActiveConversationWindow(25000);
               await sendToBackend(cleanedText);
             } else {
-              console.log('[Always-On] Background speech ignored (no wake word):', text);
+              console.log('[Always-On] Background speech ignored (no wake word match):', text);
               setIdleState('neutral', 300);
             }
           } else {
+            console.log('[MIC] No words recognized from audio.');
             setIdleState('neutral', 300);
           }
         } catch (err) {
-          console.error('Transcription error:', err);
+          console.error('[MIC] Transcription error:', err);
           setIdleState('neutral', 500);
         }
       };
@@ -948,8 +962,10 @@ function App() {
 
         if (volume > SILENCE_THRESHOLD) {
           hasSpoken = true;
+          speechFrames++;
           silentFrames = 0;
-        } else if (hasSpoken) {
+        } else if (hasSpoken && speechFrames >= 5) {
+          // Only count silence after at least ~400ms of active speech has been captured
           silentFrames++;
           if (silentFrames >= SILENCE_FRAMES_TO_STOP) {
             clearInterval(vadInterval);
@@ -990,7 +1006,7 @@ function App() {
       alwaysOnRef.current = nextVal;
       try {
         localStorage.setItem('sylphya_always_on', String(nextVal));
-      } catch {}
+      } catch { }
 
       if (nextVal) {
         showSubtitle('Always-On active: Say "Hey Sylphya" anytime!', 4000);
@@ -1028,7 +1044,7 @@ function App() {
       };
       ipc.on('cursor-pos', onGlobalCursor);
       cleanupIpc = () => {
-        try { ipc.removeListener('cursor-pos', onGlobalCursor); } catch {}
+        try { ipc.removeListener('cursor-pos', onGlobalCursor); } catch { }
       };
     }
 
@@ -1073,7 +1089,7 @@ function App() {
         try {
           ipc.removeListener('hotkey-listen', handleHotkey);
           ipc.removeListener('hotkey-toggle-always-on', handleHotkeyToggleAlwaysOn);
-        } catch {}
+        } catch { }
       };
     }
 
@@ -1096,35 +1112,35 @@ function App() {
   // Status & Mode Styling Config
   const toggleTheme = isSleeping
     ? {
-        bg: 'rgba(99, 102, 241, 0.3)',
-        border: 'rgba(129, 140, 248, 0.6)',
-        dot: '#818cf8',
-        glow: 'rgba(99, 102, 241, 0.5)',
-        label: 'Sleeping (Tap mascot to wake)',
-      }
+      bg: 'rgba(99, 102, 241, 0.3)',
+      border: 'rgba(129, 140, 248, 0.6)',
+      dot: '#818cf8',
+      glow: 'rgba(99, 102, 241, 0.5)',
+      label: 'Sleeping (Tap mascot to wake)',
+    }
     : isAlwaysOn
       ? isInActiveWindow
         ? {
-            bg: 'rgba(59, 130, 246, 0.3)',
-            border: 'rgba(96, 165, 250, 0.6)',
-            dot: '#60a5fa',
-            glow: 'rgba(59, 130, 246, 0.5)',
-            label: 'Active Chat Mode',
-          }
+          bg: 'rgba(59, 130, 246, 0.3)',
+          border: 'rgba(96, 165, 250, 0.6)',
+          dot: '#60a5fa',
+          glow: 'rgba(59, 130, 246, 0.5)',
+          label: 'Active Chat Mode',
+        }
         : {
-            bg: 'rgba(34, 197, 94, 0.25)',
-            border: 'rgba(74, 222, 128, 0.6)',
-            dot: '#22c55e',
-            glow: 'rgba(34, 197, 94, 0.5)',
-            label: 'Always-On (Say "Hey Sylphya")',
-          }
+          bg: 'rgba(34, 197, 94, 0.25)',
+          border: 'rgba(74, 222, 128, 0.6)',
+          dot: '#22c55e',
+          glow: 'rgba(34, 197, 94, 0.5)',
+          label: 'Always-On (Say "Hey Sylphya")',
+        }
       : {
-          bg: 'rgba(255, 255, 255, 0.08)',
-          border: 'rgba(255, 255, 255, 0.2)',
-          dot: '#9ca3af',
-          glow: 'rgba(255, 255, 255, 0.2)',
-          label: 'Push-to-Talk (Ctrl+Space or tap mascot)',
-        };
+        bg: 'rgba(255, 255, 255, 0.08)',
+        border: 'rgba(255, 255, 255, 0.2)',
+        dot: '#9ca3af',
+        glow: 'rgba(255, 255, 255, 0.2)',
+        label: 'Push-to-Talk (Ctrl+Space or tap mascot)',
+      };
 
   return (
     <>
@@ -1194,20 +1210,20 @@ function App() {
       )}
 
       {/* Main Transparent Canvas: Tap-to-Talk, Drag Window & Pixel-Accurate Click-Through */}
-      <div 
-        className="canvas-wrapper" 
-        ref={canvasRef} 
+      <div
+        className="canvas-wrapper"
+        ref={canvasRef}
         onPointerDown={(e) => {
           try {
             (e.target as HTMLElement).setPointerCapture(e.pointerId);
-          } catch {}
+          } catch { }
           let winPos = [0, 0];
           try {
             const ipc = getElectronIpc();
             if (ipc?.sendSync) {
               winPos = ipc.sendSync('get-window-pos') || [0, 0];
             }
-          } catch {}
+          } catch { }
 
           dragRef.current = {
             isDragging: true,
@@ -1229,7 +1245,7 @@ function App() {
           if (dragRef.current.isDragging) {
             const dx = e.screenX - dragRef.current.startX;
             const dy = e.screenY - dragRef.current.startY;
-            
+
             if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
               dragRef.current.hasMoved = true;
             }
@@ -1242,7 +1258,7 @@ function App() {
                 if (!isNaN(newX) && !isNaN(newY)) {
                   ipc?.send('set-window-pos', newX, newY);
                 }
-              } catch {}
+              } catch { }
             }
           } else {
             updateHitTest(e.clientX, e.clientY);
@@ -1251,13 +1267,13 @@ function App() {
         onPointerUp={(e) => {
           try {
             (e.target as HTMLElement).releasePointerCapture(e.pointerId);
-          } catch {}
+          } catch { }
           dragRef.current.isDragging = false;
-          
+
           if (!dragRef.current.hasMoved && state === 'ready') {
             try {
               modelRef.current?.tap(e.clientX, e.clientY);
-            } catch {}
+            } catch { }
 
             if (isSleepingRef.current) {
               wakeUpFromSleep(

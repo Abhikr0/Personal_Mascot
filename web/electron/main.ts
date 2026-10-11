@@ -10,6 +10,14 @@ const __dirname = path.dirname(__filename);
 
 process.env['ELECTRON_DISABLE_SECURITY_WARNINGS'] = 'true';
 
+// Ensure crisp rendering on HiDPI / Retina displays
+app.commandLine.appendSwitch('high-dpi-support', '1');
+app.commandLine.appendSwitch('force-device-scale-factor', '0'); // Let OS handle it natively
+
+// Suppress internal Chromium sandbox/macOS CoreServices noise (SetApplicationIsDaemon paramErr -50)
+app.commandLine.appendSwitch('log-level', '3'); // Log fatal errors only
+app.commandLine.appendSwitch('disable-logging');
+
 let mainWindow: BrowserWindow | null = null;
 let pythonProcess: ChildProcess | null = null;
 
@@ -44,13 +52,20 @@ ipcMain.on('set-ignore-mouse-events', (event, ignore: boolean, options?: any) =>
 
 
 function createWindow() {
-  const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const workArea = primaryDisplay.workArea;
+  
+  const winW = 440;
+  const winH = 540;
+  // Position with comfortable margin from bottom-right, safely above Dock
+  const posX = Math.max(0, Math.round(workArea.x + workArea.width - winW - 16));
+  const posY = Math.max(0, Math.round(workArea.y + workArea.height - winH - 16));
   
   mainWindow = new BrowserWindow({
-    width: 440,
-    height: 540,
-    x: width - 440, // Put her in the bottom right corner by default
-    y: height - 540,
+    width: winW,
+    height: winH,
+    x: posX,
+    y: posY,
     transparent: true,
     frame: false,
     hasShadow: false,
@@ -63,6 +78,12 @@ function createWindow() {
     },
   });
 
+  // Ensure window is visible on all macOS workspaces / spaces
+  if (process.platform === 'darwin') {
+    mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnAllWorkspaces: true });
+    mainWindow.setAlwaysOnTop(true, 'floating');
+  }
+
   // Load the Vite dev server URL or the built index.html
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
@@ -70,9 +91,16 @@ function createWindow() {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }
 
-  // Prevent white flashes on load
-  mainWindow.on('ready-to-show', () => {
+  // Show window reliably
+  mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
+    mainWindow?.focus();
+  });
+
+  // Forward renderer console logs to terminal
+  mainWindow.webContents.on('console-message', (event: any) => {
+    const msg = event?.message ?? event;
+    if (msg) console.log(`[UI]: ${msg}`);
   });
 }
 
@@ -162,12 +190,14 @@ app.whenReady().then(async () => {
   }
   createWindow();
 
-  // Register global hands-free hotkey (Ctrl+Space to talk / interrupt)
-  globalShortcut.register('CommandOrControl+Space', () => {
+  // Register global hands-free hotkeys (Ctrl+Space or Option+Space to talk / interrupt)
+  const triggerListen = () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('hotkey-listen');
     }
-  });
+  };
+  globalShortcut.register('CommandOrControl+Space', triggerListen);
+  globalShortcut.register('Alt+Space', triggerListen);
 
   // Register global hotkey to toggle Always-On / Wake Word mode (Ctrl+Shift+A)
   globalShortcut.register('CommandOrControl+Shift+A', () => {
@@ -183,14 +213,33 @@ app.on('window-all-closed', () => {
   }
 });
 
-// Kill the python process violently when the app exits
+// Kill the python process cleanly when the app exits
+function killPythonProcess() {
+  if (pythonProcess && pythonProcess.pid) {
+    console.log("Killing Python background process...");
+    try {
+      if (process.platform === 'win32') {
+        const killer = spawn('taskkill', ['/pid', pythonProcess.pid.toString(), '/f', '/t']);
+        killer.on('error', (err) => {
+          console.error("Failed to execute taskkill on Windows:", err.message);
+        });
+      } else {
+        pythonProcess.kill('SIGKILL');
+      }
+    } catch (err) {
+      console.error("Failed to kill Python process:", err);
+    }
+    pythonProcess = null;
+  }
+}
+
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
-  if (pythonProcess) {
-    console.log("Killing Python background process...");
-    // Force kill on Windows
-    spawn('taskkill', ['/pid', pythonProcess.pid!.toString(), '/f', '/t']);
-  }
+  killPythonProcess();
+});
+
+process.on('exit', () => {
+  killPythonProcess();
 });
 
 // Keep exactly one instance of activate handler

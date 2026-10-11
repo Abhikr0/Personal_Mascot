@@ -14,6 +14,9 @@ export default defineConfig({
     electron([
       {
         entry: 'electron/main.ts',
+        onstart(args) {
+          args.startup(['.', '--log-level=3', '--disable-logging'])
+        },
       },
     ]),
     renderer(),

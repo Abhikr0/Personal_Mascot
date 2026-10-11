@@ -2,10 +2,105 @@ import os
 import re
 import json
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
+
+
+# =========================================================================
+# TOOL PRUNING  — Send only relevant tools instead of all 33 every turn
+# =========================================================================
+
+# Tools that are always injected regardless of message content
+_ALWAYS_ON_TOOLS: Set[str] = {
+    "web_search",
+    "get_current_time",
+    "get_weather",
+    "get_system_status",
+    "remember_fact",
+}
+
+# Keyword → extra tool names to inject when the keyword appears in the user message
+_KEYWORD_TOOL_MAP: Dict[str, Set[str]] = {
+    # File operations
+    "file": {"read_file", "write_file", "list_directory"},
+    "read":  {"read_file"},
+    "write": {"write_file"},
+    "folder": {"list_directory", "create_directory"},
+    "directory": {"list_directory", "create_directory"},
+    # App / window control
+    "open":   {"open_application", "open_url_in_browser"},
+    "launch": {"open_application"},
+    "close":  {"close_application"},
+    "app":    {"open_application", "close_application", "list_running_apps"},
+    "window": {"get_window_title", "list_running_apps"},
+    # Music / media
+    "music": {"play_music", "pause_music", "skip_track", "get_now_playing"},
+    "play":  {"play_music", "open_application"},
+    "pause": {"pause_music"},
+    "song":  {"play_music", "get_now_playing"},
+    "spotify": {"play_music", "pause_music", "skip_track", "get_now_playing"},
+    # Volume / brightness
+    "volume": {"set_volume", "get_volume"},
+    "brightness": {"set_brightness"},
+    "mute":   {"set_volume"},
+    # Screenshot / camera
+    "screenshot": {"take_screenshot"},
+    "screen": {"take_screenshot", "get_window_title"},
+    # Clipboard
+    "clipboard": {"read_clipboard", "write_clipboard"},
+    "copy": {"read_clipboard"},
+    "paste": {"write_clipboard"},
+    # Terminal / shell
+    "run":     {"run_shell_command"},
+    "command": {"run_shell_command"},
+    "terminal": {"run_shell_command"},
+    "shell": {"run_shell_command"},
+    # Reminders / notes
+    "remind": {"set_reminder", "list_reminders"},
+    "reminder": {"set_reminder", "list_reminders"},
+    "note": {"create_note", "read_notes"},
+    "alarm": {"set_reminder"},
+    # Calendar / schedule
+    "calendar": {"list_calendar_events", "create_calendar_event"},
+    "schedule": {"list_calendar_events", "create_calendar_event"},
+    "event": {"list_calendar_events", "create_calendar_event"},
+    # Email
+    "email": {"send_email", "read_emails"},
+    "mail":  {"send_email", "read_emails"},
+    # Memory
+    "remember": {"remember_fact", "search_memories"},
+    "forget": {"delete_memory"},
+    "memory": {"search_memories", "list_memories"},
+}
+
+
+def _prune_tools(tools: List[Any], last_user_message: str = "") -> List[Any]:
+    """Return a reduced tool list based on always-on tools + keyword matching."""
+    if not tools:
+        return tools
+
+    tool_name_map = {t.name: t for t in tools}
+    selected_names: Set[str] = set(_ALWAYS_ON_TOOLS)
+
+    # Add keyword-matched tools
+    words = set(re.findall(r"\w+", last_user_message.lower()))
+    for kw, extra_tools in _KEYWORD_TOOL_MAP.items():
+        if kw in words:
+            selected_names.update(extra_tools)
+
+    # Collect matching tools (preserve original order)
+    pruned = [t for t in tools if t.name in selected_names]
+
+    # Safety: if pruning leaves us with nothing useful, return full list
+    if not pruned:
+        return tools
+
+    removed = len(tools) - len(pruned)
+    if removed > 0:
+        print(f"[TOOL-PRUNE] {len(pruned)}/{len(tools)} tools selected ({removed} pruned) for: \"{last_user_message[:60]}\"")
+    return pruned
 
 
 class ChatMessage:
@@ -94,8 +189,11 @@ def _run_mistral(
     from mistralai.client import Mistral
 
     client = Mistral(api_key=api_key)
-    tool_map = {t.name: t for t in tools}
-    tool_schemas = [t.openai_tool for t in tools] if tools else None
+    # Prune tools based on the last user message
+    last_user_msg = next((m.content for m in reversed(messages) if m.role == "user"), "")
+    effective_tools = _prune_tools(tools, last_user_msg)
+    tool_map = {t.name: t for t in tools}  # keep full map for execution
+    tool_schemas = [t.openai_tool for t in effective_tools] if effective_tools else None
 
     history = [m.to_dict() for m in messages]
     result_messages: List[ChatMessage] = []
@@ -106,7 +204,7 @@ def _run_mistral(
             messages=history,
             tools=tool_schemas,
             temperature=0.7,
-            max_tokens=150
+            max_tokens=400
         )
         choice = resp.choices[0]
         msg = choice.message
@@ -185,7 +283,10 @@ def _run_gemini(
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    tool_map = {t.name: t for t in tools}
+    tool_map = {t.name: t for t in tools}  # full map for execution
+    # Prune tools based on the last user message
+    last_user_msg = next((m.content for m in reversed(messages) if m.role == "user"), "")
+    effective_tools = _prune_tools(tools, last_user_msg)
 
     # Extract system instruction
     sys_instruction = None
@@ -198,11 +299,11 @@ def _run_gemini(
         elif m.role == "assistant":
             contents.append(types.Content(role="model", parts=[types.Part.from_text(text=m.content)]))
 
-    tool_callables = [t.fn for t in tools] if tools else None
+    tool_callables = [t.fn for t in effective_tools] if effective_tools else None
     config = types.GenerateContentConfig(
         system_instruction=sys_instruction,
         temperature=0.7,
-        max_output_tokens=150,
+        max_output_tokens=400,
         tools=tool_callables
     )
 
@@ -271,19 +372,22 @@ def _run_groq(
     from groq import Groq
 
     client = Groq(api_key=api_key)
-    tool_map = {t.name: t for t in tools}
-    tool_schemas = [t.openai_tool for t in tools] if tools else None
+    tool_map = {t.name: t for t in tools}  # full map for execution
+    # Prune tools based on the last user message
+    last_user_msg = next((m.content for m in reversed(messages) if m.role == "user"), "")
+    effective_tools = _prune_tools(tools, last_user_msg)
+    tool_schemas = [t.openai_tool for t in effective_tools] if effective_tools else None
 
     history = [m.to_dict() for m in messages]
     result_messages: List[ChatMessage] = []
 
     for _ in range(5):
         resp = client.chat.completions.create(
-            model=model_name or "llama-3.3-70b-versatile",
+            model=model_name or "qwen/qwen3.8-27b",
             messages=history,
             tools=tool_schemas,
             temperature=0.7,
-            max_tokens=150
+            max_tokens=400
         )
         choice = resp.choices[0]
         msg = choice.message

@@ -79,7 +79,7 @@ def summarize_history(messages: list) -> str:
             from groq import Groq
             client = Groq(api_key=groq_key)
             resp = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="qwen/qwen3.8-27b",
                 messages=[
                     {"role": "system", "content": _SUMMARIZE_SYSTEM},
                     {"role": "user", "content": prompt}
