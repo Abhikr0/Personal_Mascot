@@ -926,8 +926,9 @@ def get_available_voices():
     """List available Edge-TTS voices"""
     voices = [
         {"id": "en-GB-SoniaNeural", "name": "Sonia (UK Neural)", "engine": "edge"},
-        {"id": "en-IN-AriaNeural", "name": "Aria (US Neural)", "engine": "edge"},
-        {"id": "en-IN-GuyNeural", "name": "Guy (US Neural)", "engine": "edge"},
+        {"id": "en-US-AriaNeural", "name": "Aria (US Neural)", "engine": "edge"},
+        {"id": "en-US-GuyNeural", "name": "Guy (US Neural)", "engine": "edge"},
+        {"id": "en-IN-NeerjaNeural", "name": "Neerja (India Neural)", "engine": "edge"},
     ]
     return {
         "status": "success",
@@ -935,6 +936,9 @@ def get_available_voices():
         "current_voice": EDGE_VOICE,
         "voices": voices
     }
+
+class VoiceSelectRequest(BaseModel):
+    voice: str
 
 @app.post("/api/voice/select")
 def select_voice(req: VoiceSelectRequest):
