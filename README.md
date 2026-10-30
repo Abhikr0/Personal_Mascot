@@ -60,7 +60,8 @@ Copy `.env.example` to `.env` and fill in your API keys:
 cp .env.example .env
 ```
 Supported providers:
-- `GROQ_API_KEY`: Ultra-low-latency LLM inference
+- `HERMES_API_KEY`: Hermes local agent gateway (`http://127.0.0.1:8642/v1`)
+- `GROQ_API_KEY`: Ultra-low-latency STT and LLM fallback
 - `MISTRAL_API_KEY`: Advanced reasoning & tool execution
 - `GEMINI_API_KEY`: Multimodal & general operations
 

@@ -24,55 +24,54 @@ _ALWAYS_ON_TOOLS: Set[str] = {
 # Keyword → extra tool names to inject when the keyword appears in the user message
 _KEYWORD_TOOL_MAP: Dict[str, Set[str]] = {
     # File operations
-    "file": {"read_file", "write_file", "list_directory"},
+    "file": {"read_file", "list_files"},
     "read":  {"read_file"},
-    "write": {"write_file"},
-    "folder": {"list_directory", "create_directory"},
-    "directory": {"list_directory", "create_directory"},
+    "write": {"create_or_write_file"},
+    "folder": {"list_files", "create_folder"},
+    "directory": {"list_files", "create_folder"},
     # App / window control
-    "open":   {"open_application", "open_url_in_browser"},
-    "launch": {"open_application"},
-    "close":  {"close_application"},
-    "app":    {"open_application", "close_application", "list_running_apps"},
-    "window": {"get_window_title", "list_running_apps"},
+    "open":   {"open_app", "open_website"},
+    "launch": {"open_app"},
+    "close":  {"close_app"},
+    "app":    {"open_app", "close_app", "list_running_apps"},
+    "window": {"get_frontmost_app", "list_running_apps"},
     # Music / media
-    "music": {"play_music", "pause_music", "skip_track", "get_now_playing"},
-    "play":  {"play_music", "open_application"},
-    "pause": {"pause_music"},
-    "song":  {"play_music", "get_now_playing"},
-    "spotify": {"play_music", "pause_music", "skip_track", "get_now_playing"},
-    # Volume / brightness
+    "music": {"play_music", "control_music", "get_volume"},
+    "play":  {"play_music", "open_app"},
+    "pause": {"control_music"},
+    "song":  {"play_music"},
+    "spotify": {"play_music", "control_music"},
+    # Volume
     "volume": {"set_volume", "get_volume"},
-    "brightness": {"set_brightness"},
     "mute":   {"set_volume"},
-    # Screenshot / camera
+    # Screenshot
     "screenshot": {"take_screenshot"},
-    "screen": {"take_screenshot", "get_window_title"},
+    "screen": {"take_screenshot", "get_frontmost_app"},
     # Clipboard
-    "clipboard": {"read_clipboard", "write_clipboard"},
-    "copy": {"read_clipboard"},
-    "paste": {"write_clipboard"},
-    # Terminal / shell
-    "run":     {"run_shell_command"},
-    "command": {"run_shell_command"},
-    "terminal": {"run_shell_command"},
-    "shell": {"run_shell_command"},
-    # Reminders / notes
-    "remind": {"set_reminder", "list_reminders"},
-    "reminder": {"set_reminder", "list_reminders"},
-    "note": {"create_note", "read_notes"},
-    "alarm": {"set_reminder"},
-    # Calendar / schedule
-    "calendar": {"list_calendar_events", "create_calendar_event"},
-    "schedule": {"list_calendar_events", "create_calendar_event"},
-    "event": {"list_calendar_events", "create_calendar_event"},
-    # Email
-    "email": {"send_email", "read_emails"},
-    "mail":  {"send_email", "read_emails"},
+    "clipboard": {"get_clipboard_text", "set_clipboard_text"},
+    "copy": {"get_clipboard_text"},
+    "paste": {"set_clipboard_text"},
+    # Notes
+    "note": {"open_notes_and_write", "read_notes"},
+    "notes": {"open_notes_and_write", "read_notes"},
+    "write": {"open_notes_and_write", "create_or_write_file"},
+    # Shortcuts / automation
+    "shortcut": {"run_shortcut"},
+    "automate": {"run_shortcut"},
     # Memory
-    "remember": {"remember_fact", "search_memories"},
-    "forget": {"delete_memory"},
-    "memory": {"search_memories", "list_memories"},
+    "remember": {"remember_information", "recall_memory"},
+    "forget": {"forget_memory"},
+    "memory": {"recall_memory", "list_memories"},
+    # Search / web
+    "search": {"web_search"},
+    "web": {"web_search", "open_url"},
+    # System
+    "lock": {"lock_screen"},
+    "sleep": {"sleep_mac"},
+    "battery": {"get_battery"},
+    "trash": {"empty_trash"},
+    "notification": {"send_notification"},
+    "notify": {"send_notification"},
 }
 
 
@@ -204,7 +203,7 @@ def _run_mistral(
             messages=history,
             tools=tool_schemas,
             temperature=0.7,
-            max_tokens=400
+            max_tokens=1024
         )
         choice = resp.choices[0]
         msg = choice.message
@@ -387,7 +386,7 @@ def _run_groq(
             messages=history,
             tools=tool_schemas,
             temperature=0.7,
-            max_tokens=400
+            max_tokens=1024
         )
         choice = resp.choices[0]
         msg = choice.message
@@ -453,6 +452,134 @@ def _run_groq(
     return result_messages
 
 
+def _run_hermes(
+    messages: List[ChatMessage],
+    model_name: str,
+    tools: List[Any],
+    api_key: str,
+    api_base: Optional[str] = None
+) -> List[ChatMessage]:
+    """Runs a turn against Hermes local OpenAI-compatible API server (default http://127.0.0.1:8642)."""
+    try:
+        import httpx
+        has_httpx = True
+    except ImportError:
+        has_httpx = False
+        import requests
+
+    base_url = (api_base or os.getenv("HERMES_API_BASE", "http://127.0.0.1:8642/v1")).rstrip("/")
+    url = f"{base_url}/chat/completions"
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    history = [m.to_dict() for m in messages]
+
+    # Prune tools based on the last user message
+    last_user_msg = next((m.content for m in reversed(messages) if m.role == "user"), "")
+    effective_tools = _prune_tools(tools, last_user_msg) if tools else []
+    tool_map = {t.name: t for t in tools} if tools else {}
+    tool_schemas = [t.openai_tool for t in effective_tools] if effective_tools else None
+
+    result_messages: List[ChatMessage] = []
+
+    resolved_model = model_name or os.getenv("HERMES_MODEL", "hermes-agent")
+    payload: Dict[str, Any] = {
+        "model": resolved_model,
+        "messages": history,
+        "temperature": 0.7,
+        "stream": False
+    }
+
+    # If calling a model other than hermes-agent, provide client-side tool schemas
+    if tool_schemas and resolved_model != "hermes-agent":
+        payload["tools"] = tool_schemas
+
+    if has_httpx:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    else:
+        resp = requests.post(url, headers=headers, json=payload, timeout=8.0)
+        resp.raise_for_status()
+        data = resp.json()
+
+    choice = data.get("choices", [{}])[0]
+    msg = choice.get("message", {})
+    content = msg.get("content", "") or ""
+    tool_calls = msg.get("tool_calls")
+
+    if tool_calls:
+        tc_data = []
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+            tc_data.append({
+                "id": tc.get("id", ""),
+                "name": fn.get("name", ""),
+                "args": args
+            })
+        ai_msg = AIMessage(content=content, tool_calls=tc_data)
+        result_messages.append(ai_msg)
+
+        history.append({
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {
+                    "id": tc.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("function", {}).get("name"),
+                        "arguments": tc.get("function", {}).get("arguments") if isinstance(tc.get("function", {}).get("arguments"), str) else json.dumps(tc.get("function", {}).get("arguments", {}))
+                    }
+                }
+                for tc in tool_calls
+            ]
+        })
+
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            t_name = fn.get("name", "")
+            args_str = fn.get("arguments", "{}")
+            try:
+                args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
+            except Exception:
+                args = {}
+
+            tool_fn = tool_map.get(t_name)
+            if tool_fn:
+                try:
+                    res = tool_fn.invoke(args)
+                except Exception as err:
+                    res = f"Tool execution error: {err}"
+            else:
+                res = f"Tool {t_name} not found"
+
+            res_str = str(res)
+            history.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id"),
+                "name": t_name,
+                "content": res_str
+            })
+            result_messages.append(ChatMessage(role="tool", content=res_str, tool_call_id=tc.get("id"), name=t_name))
+    else:
+        final_ai = AIMessage(content=content)
+        result_messages.append(final_ai)
+
+    return result_messages
+
+
 def execute_agent_turn(
     messages: List[Any],
     provider: str,
@@ -465,7 +592,12 @@ def execute_agent_turn(
     """
     norm_messages = normalize_messages(messages)
 
-    if provider == "mistral":
+    if provider == "hermes":
+        api_key = os.getenv("HERMES_API_KEY", "")
+        api_base = os.getenv("HERMES_API_BASE", "http://127.0.0.1:8642/v1")
+        out_messages = _run_hermes(norm_messages, model_name, tools, api_key, api_base)
+
+    elif provider == "mistral":
         api_key = os.getenv("MISTRAL_API_KEY")
         if not api_key:
             raise ValueError("MISTRAL_API_KEY is not configured in environment.")
@@ -487,3 +619,4 @@ def execute_agent_turn(
         raise ValueError(f"Unsupported model provider: {provider}")
 
     return {"messages": out_messages}
+

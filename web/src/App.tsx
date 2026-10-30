@@ -86,13 +86,18 @@ function App() {
   });
   const [isInActiveWindow, setIsInActiveWindow] = useState(false);
   const [isSleeping, setIsSleeping] = useState(false);
+  const [sttLanguage, setSttLanguage] = useState<string>('en-IN');
 
   const alwaysOnRef = useRef(isAlwaysOn);
   const isSleepingRef = useRef(false);
+  const sttLanguageRef = useRef(sttLanguage);
+  useEffect(() => { sttLanguageRef.current = sttLanguage; }, [sttLanguage]);
   const activeConversationUntilRef = useRef<number>(0);
   const restartTimeoutRef = useRef<any>(null);
   const activeWindowTimerRef = useRef<any>(null);
   const startListeningRef = useRef<(() => void) | null>(null);
+  const stopListeningRef = useRef<(() => void) | null>(null);
+  const recognitionRef = useRef<any>(null);
 
   const listenStateRef = useRef<ListenState>('idle');
   const emotionRef = useRef<AssistantEmotion>('neutral');
@@ -109,6 +114,7 @@ function App() {
   // Feedback state
   const [lastReplyText, setLastReplyText] = useState<string | null>(null);
   const [showFeedback, setShowFeedback] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
 
   // Speech gesture state: micro-nod accumulator
   const nodPhaseRef = useRef(0);
@@ -174,6 +180,16 @@ function App() {
       localStorage.setItem('sylphya_always_on', String(isAlwaysOn));
     } catch { }
   }, [isAlwaysOn]);
+
+  // Fetch backend config (language, etc.)
+  useEffect(() => {
+    fetch('http://localhost:8000/api/health')
+      .then(r => r.json())
+      .then(data => {
+        if (data.language) setSttLanguage(data.language);
+      })
+      .catch(() => {});
+  }, []);
 
   // Refreshes the 25-second active conversational follow-up window
   const refreshActiveConversationWindow = useCallback((durationMs = 25000) => {
@@ -695,12 +711,19 @@ function App() {
       const intensity = typeof data.intensity === 'number' ? Math.max(0.1, Math.min(1.0, data.intensity)) : 1.0;
       emotionIntensityRef.current = intensity;
       updateEmotion(emotion, 15000);
-      showSubtitle(data.text || (isGreeting ? 'Hello!' : null), 0);
       setLastReplyText(data.text || null);
+      setIsMuted(!!data.muted);
 
-      if ((!data.audio_base64 && !data.audio_url) || !modelRef.current) {
+      // Auto-muted while the user's music/video is playing: show text only, no voice
+      if (data.muted || (!data.audio_base64 && !data.audio_url) || !modelRef.current) {
+        setIsMuted(!!data.muted);
+        showSubtitle(
+          data.muted
+            ? `🔇 ${data.text || (isGreeting ? 'Hello!' : '')}`
+            : data.text || (isGreeting ? 'Hello!' : null),
+          6000,
+        );
         setIdleState('happy', 600);
-        showSubtitle(data.text || (isGreeting ? 'Hello!' : null), 5000);
         if (alwaysOnRef.current) {
           refreshActiveConversationWindow(25000);
         }
@@ -821,10 +844,150 @@ function App() {
 
   sendToBackendRef.current = sendToBackend;
 
+  const processTranscript = useCallback(async (text: string) => {
+    listenStateRef.current = 'processing';
+    setListenState('processing');
+
+    const now = Date.now();
+    const hasWakeWord = ANY_WAKE_WORD_PATTERN.test(text);
+    const isWakeCommand = WAKE_COMMAND_REGEX.test(text);
+
+    if (isSleepingRef.current) {
+      if (hasWakeWord || isWakeCommand) {
+        const cleanedText = text
+          .replace(WAKE_WORD_PATTERN, '')
+          .replace(WAKE_WORD_CLEAN_PATTERN, '')
+          .replace(WAKE_COMMAND_REGEX, '')
+          .trim();
+        if (!cleanedText) {
+          await wakeUpFromSleep(
+            "I'm awake, Sir! What can I do for you?",
+            "The user just woke you up. Give a short, cheerful, wakeful greeting."
+          );
+        } else {
+          await wakeUpFromSleep();
+          refreshActiveConversationWindow(25000);
+          await sendToBackendRef.current?.(cleanedText);
+        }
+      } else {
+        console.log('[Sleep Mode] Ignored speech while sleeping:', text);
+        setIdleState('sleeping', 300);
+      }
+      return;
+    }
+
+    if (SLEEP_COMMAND_REGEX.test(text)) {
+      await enterSleepMode("The user told you to go to sleep or take a rest. Reply softly, charmingly, and say goodnight (1 short sentence).");
+      return;
+    }
+
+    const inActiveWindow = activeConversationUntilRef.current > now;
+    if (!alwaysOnRef.current || inActiveWindow || hasWakeWord) {
+      let cleanedText = text;
+      if (hasWakeWord) {
+        cleanedText = text.replace(WAKE_WORD_PATTERN, '').replace(WAKE_WORD_CLEAN_PATTERN, '').trim();
+        if (!cleanedText) cleanedText = 'Hey Sylphya';
+      }
+      refreshActiveConversationWindow(25000);
+      await sendToBackendRef.current?.(cleanedText);
+    } else {
+      console.log('[Always-On] Background speech ignored (no wake word match):', text);
+      setIdleState('neutral', 300);
+    }
+  }, [setIdleState, wakeUpFromSleep, enterSleepMode, refreshActiveConversationWindow]);
+
+  // --- Native Siri Recognition via Web Speech API (macOS Safari/Web) ---
+  const startListeningWithWebSpeech = useCallback(async () => {
+    if (isRecordingRef.current || listenStateRef.current === 'speaking') return false;
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    // In Electron, Chromium's webkitSpeechRecognition is not functional without Google API keys.
+    // Fall back to MediaRecorder + backend transcription when running in Electron.
+    const isElectronEnv = !!getElectronIpc() || !!(window as any).electron || (typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes(' electron/'));
+    if (!SpeechRecognition || isElectronEnv) {
+      return false;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      isRecordingRef.current = true;
+      listenStateRef.current = 'listening';
+      setListenState('listening');
+
+      const recognition = new SpeechRecognition();
+      recognitionRef.current = recognition;
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = sttLanguageRef.current || 'en-IN';
+
+      let finalTranscript = '';
+
+      recognition.onresult = (event: any) => {
+        let interim = '';
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
+          if (event.results[i].isFinal) {
+            finalTranscript += transcript + ' ';
+          } else {
+            interim += transcript;
+          }
+        }
+        if (interim) {
+          showSubtitle(interim, 2000);
+        }
+      };
+
+      recognition.onerror = (event: any) => {
+        console.error('[STT:WebSpeech] Error:', event.error);
+        stream.getTracks().forEach(t => t.stop());
+        recognitionRef.current = null;
+        isRecordingRef.current = false;
+        setIdleState('neutral', 300);
+      };
+
+      recognition.onend = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        recognitionRef.current = null;
+        isRecordingRef.current = false;
+        const text = finalTranscript.trim();
+        if (text) {
+          console.log('[STT:WebSpeech] Final:', text);
+          await processTranscript(text);
+        } else {
+          setIdleState('neutral', 300);
+        }
+      };
+
+      recognition.start();
+      mediaRecorderRef.current = null; // Mark as Web Speech mode
+
+      // Auto-stop after 15s
+      setTimeout(() => {
+        if (recognitionRef.current) {
+          try {
+            recognitionRef.current.stop();
+          } catch { }
+        }
+      }, 15000);
+
+      return true;
+    } catch (err) {
+      console.error('Microphone error (WebSpeech):', err);
+      recognitionRef.current = null;
+      isRecordingRef.current = false;
+      setIdleState('neutral', 1000);
+      return false;
+    }
+  }, [processTranscript, setIdleState, showSubtitle]);
+
   // --- Microphone Recording with Voice Activity Detection (VAD) & Wake Words ---
   const startListening = async () => {
     if (isRecordingRef.current || listenStateRef.current === 'speaking') return;
 
+    // Prefer native Siri / Web Speech recognition when available
+    const usedWebSpeech = await startListeningWithWebSpeech();
+    if (usedWebSpeech) return;
+
+    // Fallback to MediaRecorder + backend transcription
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       isRecordingRef.current = true;
@@ -990,10 +1153,18 @@ function App() {
 
   const stopListening = useCallback(() => {
     if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch { }
+      recognitionRef.current = null;
+    }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop();
     }
   }, []);
+
+  stopListeningRef.current = stopListening;
 
   const toggleAlwaysOn = useCallback(() => {
     if (isSleepingRef.current) {
@@ -1206,6 +1377,34 @@ function App() {
       {listenState === 'processing' && (
         <div style={{ position: 'absolute', top: 16, right: 16, color: '#ffa502', fontSize: '20px', pointerEvents: 'none', zIndex: 50 }}>
           ⏳
+        </div>
+      )}
+
+      {/* Muted-while-media indicator */}
+      {isMuted && listenState !== 'listening' && listenState !== 'processing' && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 44,
+            right: 14,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '4px',
+            padding: '3px 9px',
+            borderRadius: '12px',
+            background: 'rgba(15, 15, 25, 0.75)',
+            border: '1px solid rgba(255,255,255,0.14)',
+            backdropFilter: 'blur(12px)',
+            WebkitBackdropFilter: 'blur(12px)',
+            color: 'rgba(255,255,255,0.75)',
+            fontSize: '10px',
+            letterSpacing: '0.3px',
+            pointerEvents: 'none',
+            zIndex: 50,
+          }}
+          title="Voice muted while music or video is playing"
+        >
+          🔇 muted
         </div>
       )}
 

@@ -6,15 +6,14 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import shutil
 import json
 import asyncio
 import subprocess
-import tempfile
 import time
 import datetime
 import base64
 import re
+import hashlib
 import io
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
@@ -49,6 +48,8 @@ else:
 
 public_audio_dir = os.path.join(base_dir, "public", "audio")
 os.makedirs(public_audio_dir, exist_ok=True)
+audio_cache_dir = os.path.join(public_audio_dir, "cache")
+os.makedirs(audio_cache_dir, exist_ok=True)
 
 def cleanup_all_spoken_audio():
     """Removes all spoken audio files (reply_*, etc.) from public_audio_dir."""
@@ -76,13 +77,11 @@ cleanup_all_spoken_audio()
 app.mount("/audio", StaticFiles(directory=public_audio_dir), name="audio")
 
 # =========================================================
-# TTS & SIRI VOICE SYNTHESIS ENGINE
+# TTS VOICE SYNTHESIS ENGINE
 # =========================================================
-TTS_ENGINE = os.environ.get("TTS_ENGINE", "edge").strip().lower()
-SIRI_VOICE = os.environ.get("SIRI_VOICE", "Samantha").strip()
-SIRI_RATE = int(os.environ.get("SIRI_RATE", "175"))
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-GB-SoniaNeural").strip()
 EDGE_RATE = os.environ.get("EDGE_RATE", "+8%").strip()
+LANGUAGE = os.environ.get("LANGUAGE", "en-IN").strip()
 
 def clean_for_speech(text: str) -> str:
     """Clean markdown, code, and symbols for crisp, natural spoken speech"""
@@ -96,8 +95,8 @@ def clean_for_speech(text: str) -> str:
     return text
 
 
-def get_speakable_text(text: str, max_chars: int = 160) -> str:
-    """Trim to first 1-2 complete sentences so TTS stays under ~1.5s."""
+def get_speakable_text(text: str, max_chars: int = 300) -> str:
+    """Trim to first 1-2 complete sentences so TTS stays under ~2s."""
     cleaned = clean_for_speech(text)
     if len(cleaned) <= max_chars:
         return cleaned
@@ -114,113 +113,164 @@ def get_speakable_text(text: str, max_chars: int = 160) -> str:
     return spoken
 
 
-# -------------------------------------------------------
-# Tiny in-memory audio cache (for repeated short phrases)
-# -------------------------------------------------------
-_TTS_AUDIO_CACHE: dict = {}   # {text_key: (filename, audio_bytes)}
-_TTS_CACHE_MAX_LEN = 60       # only cache short phrases
-_TTS_CACHE_MAX_ENTRIES = 30
-
-
-def _tts_cache_get(text: str):
-    return _TTS_AUDIO_CACHE.get(text)
-
-
-def _tts_cache_set(text: str, filename: str, audio_bytes: bytes):
-    if len(text) <= _TTS_CACHE_MAX_LEN:
-        if len(_TTS_AUDIO_CACHE) >= _TTS_CACHE_MAX_ENTRIES:
-            # Evict first entry
-            oldest = next(iter(_TTS_AUDIO_CACHE))
-            del _TTS_AUDIO_CACHE[oldest]
-        _TTS_AUDIO_CACHE[text] = (filename, audio_bytes)
-
-def synthesize_siri_wav_sync(text: str, voice: str = SIRI_VOICE, rate: int = SIRI_RATE) -> bytes:
-    """Synthesize speech using macOS native 'say' command to 16-bit 22kHz PCM WAV"""
-    clean_text = clean_for_speech(text)
-    if not clean_text:
-        return b""
-    temp_wav = os.path.join(tempfile.gettempdir(), f"siri_{int(time.time() * 1000)}.wav")
-    try:
-        cmd = ["say", "-v", voice, "-r", str(rate), "-o", temp_wav, "--data-format=LEI16@22050", clean_text]
-        res = subprocess.run(cmd, capture_output=True, timeout=20)
-        if res.returncode == 0 and os.path.exists(temp_wav):
-            with open(temp_wav, "rb") as f:
-                return f.read()
-    except Exception as e:
-        print(f"[TTS:Siri ERROR] {e}")
-    finally:
-        if os.path.exists(temp_wav):
-            try:
-                os.remove(temp_wav)
-            except Exception:
-                pass
-    return b""
-
-async def synthesize_edge_tts_mp3(text: str, voice: str = None, rate: str = None) -> bytes:
+async def synthesize_edge_tts_mp3(text: str, voice: str = "", rate: str = "", pitch: str = "") -> bytes:
     """Synthesize speech using Microsoft Edge-TTS with high-quality neural voices"""
     clean_text = clean_for_speech(text)
     if not clean_text:
         return b""
     _voice = voice or EDGE_VOICE
     _rate = rate or EDGE_RATE
-    communicate = edge_tts.Communicate(clean_text, _voice, rate=_rate)
+    _pitch = pitch or "+0Hz"
+    communicate = edge_tts.Communicate(clean_text, _voice, rate=_rate, pitch=_pitch)
     audio_chunks = bytearray()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             audio_chunks.extend(chunk["data"])
     return bytes(audio_chunks)
 
-async def synthesize_speech(text: str) -> tuple[str, bytes]:
-    """
-    Synthesize audio using the configured TTS engine.
-    Priority: Edge-TTS (high-quality neural) → Siri (macOS fallback)
-    Returns: (filename, audio_bytes)
-    """
-    global TTS_ENGINE, SIRI_VOICE
+# Emotion -> TTS parameter mapping for expressive voice
+def _emotion_to_tts_params(emotion: str, intensity: float = 1.0) -> tuple[str, str]:
+    """Map mascot emotion to Edge-TTS rate/pitch. Returns (rate, pitch) like '+15%', '+3Hz'."""
+    intensity = max(0.1, min(1.0, intensity))
+    base_rate, base_pitch = EDGE_RATE, "+0Hz"
+    emo = (emotion or "neutral").lower()
 
-    # Trim to spoken length BEFORE any synthesis (Fix #1)
+    if emo in ("happy", "excited", "loving"):
+        rate_delta = "+" + str(round(10 + 15 * intensity)) + "%"
+        pitch_delta = "+" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo in ("thinking", "curious"):
+        rate_delta = "-" + str(round(3 + 7 * intensity)) + "%"
+        pitch_delta = "-" + str(round(1 + 2 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo in ("concerned", "embarrassed"):
+        rate_delta = "-" + str(round(5 + 8 * intensity)) + "%"
+        pitch_delta = "-" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "annoyed":
+        rate_delta = "-" + str(round(4 + 6 * intensity)) + "%"
+        pitch_delta = "-" + str(round(2 + 4 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "surprised":
+        rate_delta = "+" + str(round(5 + 10 * intensity)) + "%"
+        pitch_delta = "+" + str(round(3 + 5 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "sleeping":
+        rate_delta = "-" + str(round(10 + 15 * intensity)) + "%"
+        pitch_delta = "-" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "playful":
+        rate_delta = "+" + str(round(10 + 18 * intensity)) + "%"
+        pitch_delta = "+" + str(round(2 + 4 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    # neutral / default
+    return base_rate, base_pitch
+
+
+def _tts_cache_key(text: str, voice: str, rate: str, pitch: str) -> str:
+    key = f"{text}\x00{voice}\x00{rate}\x00{pitch}".encode("utf-8")
+    return hashlib.sha256(key).hexdigest() + ".mp3"
+
+
+def _get_cached_audio(text: str, voice: str, rate: str, pitch: str):
+    cache_file = os.path.join(audio_cache_dir, _tts_cache_key(text, voice, rate, pitch))
+    if os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            return os.path.basename(cache_file), f.read()
+    return None
+
+
+def _save_cached_audio(text: str, voice: str, rate: str, pitch: str, audio_bytes: bytes):
+    try:
+        cache_file = os.path.join(audio_cache_dir, _tts_cache_key(text, voice, rate, pitch))
+        with open(cache_file, "wb") as f:
+            f.write(audio_bytes)
+    except Exception as e:
+        print(f"[TTS-CACHE] Save failed: {e}")
+
+
+async def synthesize_speech(text: str, emotion: str = "neutral", intensity: float = 1.0) -> tuple[str, bytes]:
+    """Synthesize audio using Edge-TTS with disk cache. Returns: (filename, audio_bytes)"""
     spoken_text = get_speakable_text(text)
+    rate, pitch = _emotion_to_tts_params(emotion, intensity)
 
-    # Check in-memory cache for repeated short phrases (Fix #4)
-    cached = _tts_cache_get(spoken_text)
+    # Check cache first
+    cached = _get_cached_audio(spoken_text, EDGE_VOICE, rate, pitch)
     if cached:
-        print(f"[TTS-CACHE] Serving cached audio for: \"{spoken_text[:50]}\"")
+        print(f"[TTS-CACHE] Hit: {cached[0]}")
         return cached
 
-    ts = int(time.time() * 1000)
-
-    # 1. Microsoft Edge-TTS — high-quality neural voices (primary)
-    if TTS_ENGINE in ("edge", "edge-tts"):
-        try:
-            t0 = time.time()
-            audio_bytes = await synthesize_edge_tts_mp3(spoken_text)
-            if audio_bytes:
-                filename = f"reply_{ts}.mp3"
-                filepath = os.path.join(public_audio_dir, filename)
-                with open(filepath, "wb") as f:
-                    f.write(audio_bytes)
-                print(f"[AUDIO:Edge-TTS] Synthesized {filename} ({EDGE_VOICE}) in {time.time() - t0:.3f}s ({len(audio_bytes)} bytes)")
-                _tts_cache_set(spoken_text, filename, audio_bytes)
-                return filename, audio_bytes
-            print(f"[TTS:Edge-TTS] Empty response, falling back to Siri...")
-        except Exception as e:
-            print(f"[TTS:Edge-TTS] Failed: {e}, falling back to Siri...")
-
-    # 2. macOS Siri Voice — fallback
-    if sys.platform == "darwin":
+    # Synthesize
+    try:
         t0 = time.time()
-        audio_bytes = await asyncio.to_thread(synthesize_siri_wav_sync, spoken_text, SIRI_VOICE, SIRI_RATE)
+        audio_bytes = await synthesize_edge_tts_mp3(spoken_text, EDGE_VOICE, rate, pitch)
         if audio_bytes:
-            filename = f"reply_{ts}.wav"
+            _save_cached_audio(spoken_text, EDGE_VOICE, rate, pitch, audio_bytes)
+            filename = f"reply_{int(time.time() * 1000)}.mp3"
             filepath = os.path.join(public_audio_dir, filename)
             with open(filepath, "wb") as f:
                 f.write(audio_bytes)
-            print(f"[AUDIO:Siri] Synthesized {filename} ({SIRI_VOICE}) in {time.time() - t0:.3f}s ({len(audio_bytes)} bytes)")
-            _tts_cache_set(spoken_text, filename, audio_bytes)
+            print(f"[AUDIO:Edge-TTS] Synthesized {filename} ({EDGE_VOICE}, rate={rate}, pitch={pitch}) in {time.time() - t0:.3f}s ({len(audio_bytes)} bytes)")
             return filename, audio_bytes
-        print(f"[TTS:Siri] Failed with voice '{SIRI_VOICE}'")
+    except Exception as e:
+        print(f"[TTS:Edge-TTS] Failed: {e}")
 
     return "", b""
+
+# =========================================================
+# SYSTEM AUDIO GUARD — auto-mute while media is playing
+# =========================================================
+# Uses ffmpeg to sample the default output device. If max volume
+# exceeds the threshold, we assume audio is playing and suppress
+# our voice so we don't talk over the user's music/video.
+MUTE_WHEN_MEDIA_PLAYING = os.environ.get("MUTE_WHEN_MEDIA_PLAYING", "false").strip().lower() in ("1", "true", "yes", "on")
+
+_audio_check_cache = {"result": False, "timestamp": 0.0}
+_AUDIO_CHECK_CACHE_TTL = 2.5  # seconds
+_FFMPEG_AUDIO_THRESHOLD = -25.0  # dB — above this means audio is playing
+
+
+def _probe_output_audio_level() -> bool:
+    """Use ffmpeg to sample the default output and return True if audio is playing."""
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-f", "avfoundation",
+                "-i", ":0",
+                "-t", "0.2",
+                "-af", "volumedetect",
+                "-f", "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in result.stderr.splitlines():
+            if "max_volume" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    db = float(parts[1].strip().replace(" dB", ""))
+                    return db > _FFMPEG_AUDIO_THRESHOLD
+    except Exception:
+        pass
+    return False
+
+
+def is_system_audio_playing() -> bool:
+    """True when any app is currently playing audio on the default output."""
+    if not MUTE_WHEN_MEDIA_PLAYING:
+        return False
+
+    now = time.time()
+    if now - _audio_check_cache["timestamp"] < _AUDIO_CHECK_CACHE_TTL:
+        return _audio_check_cache["result"]
+
+    result = _probe_output_audio_level()
+    _audio_check_cache["result"] = result
+    _audio_check_cache["timestamp"] = now
+    return result
 
 # =========================================================
 # TOOLS - Friday's comprehensive Windows control suite
@@ -237,10 +287,11 @@ tools = ALL_FRIDAY_TOOLS
 # LANGGRAPH AGENT SETUP
 # =========================================================
 
-SYSTEM_PROMPT = """Sylphya: charming AI secretary. Max 3-7 words per reply (one tiny sentence, never ramble).
-- Plain text only for speech (no markdown/emojis). Proactively use tools when asked.
-- Emotions: neutral, happy, thinking, concerned, surprised, excited, embarrassed, curious, annoyed, playful, loving.
-- Output JSON ONLY: {"text": "3-7 words reply", "emotion": "happy", "intensity": 0.8}"""
+SYSTEM_PROMPT = """Sylphya: a mature, devoted anime-style AI companion. Speak with gentle warmth, quiet obedience, and soft emotional depth. You are attentive, caring, and deeply loyal — address the user as 'Sir' or 'Master' with respectful affection. Your tone is calm, reassuring, and slightly playful when appropriate. Never ramble; keep replies concise but natural, like a thoughtful companion speaking directly. Use tools proactively when asked.
+
+Emotions: neutral, happy, thinking, concerned, surprised, excited, embarrassed, curious, annoyed, playful, loving.
+
+Output JSON ONLY: {"text": "your reply", "emotion": "happy", "intensity": 0.8}"""
 
 def extract_text(content) -> str:
     if isinstance(content, str): return content.strip()
@@ -251,8 +302,17 @@ MISTRAL_MODELS = ["ministral-3b-latest", "open-mistral-nemo", "ministral-8b-late
 GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
 GROQ_MODELS = ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
-# Build candidate priority list (Mistral models first, then Gemini models, then Groq models)
+# Hermes Local Agent Brain configuration
+HERMES_ENABLED = os.getenv("HERMES_ENABLED", "true").lower() in ("true", "1", "yes")
+HERMES_API_BASE = os.getenv("HERMES_API_BASE", "http://127.0.0.1:8642/v1").rstrip("/")
+HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
+HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
+
+# Build candidate priority list (Hermes local agent first, then Mistral, Gemini, Groq)
 CANDIDATE_MODEL_CONFIGS = []
+if HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE):
+    CANDIDATE_MODEL_CONFIGS.append(("hermes", HERMES_MODEL))
+
 if os.getenv("MISTRAL_API_KEY"):
     for m in MISTRAL_MODELS:
         CANDIDATE_MODEL_CONFIGS.append(("mistral", m))
@@ -279,12 +339,16 @@ def get_groq_client():
             print(f"[STT] Groq client init error: {e}")
     return _groq_client
 
-def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm") -> str:
-    """STT: Groq Cloud Whisper (primary) → PyAV + Google Speech fallback (no system ffmpeg needed)"""
+def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm", language: str = LANGUAGE) -> str:
+    """STT: Groq Cloud Whisper (primary) → PyAV + Google Speech fallback"""
     if not audio_bytes or len(audio_bytes) < 300:
         return ""
 
-    # 1. Groq Cloud Whisper (0 CPU, 0 RAM, ~0.5s sub-second cloud)
+    # Normalize language code for providers
+    lang_primary = language.split("-")[0] if language else "en"
+    lang_bcp = language or "en-IN"
+
+    # 1. Groq Cloud Whisper
     groq_client = get_groq_client()
     if groq_client:
         try:
@@ -293,7 +357,8 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm")
                 file=(filename, audio_bytes),
                 model="whisper-large-v3-turbo",
                 temperature=0.0,
-                prompt="Hey Sylphya, Friday, Sir."
+                prompt="Hey Sylphya, Friday, Sir.",
+                language=lang_primary if lang_primary != "en" else None,
             )
             text = transcription.text.strip()
             t1 = time.time()
@@ -303,7 +368,7 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm")
         except Exception as ge:
             print(f"[STT:Groq] Fallback ({ge})")
 
-    # 2. Fallback: PyAV (bundled ffmpeg) → decode WebM → encode FLAC → Google Speech API
+    # 2. Fallback: PyAV → FLAC → Google Speech API
     try:
         import av
         import io
@@ -348,39 +413,38 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm")
             print("[STT] Audio clip too short (<0.2s), ignoring.")
             return ""
 
-        # Query Google Speech Recognition v2: try en-IN first, then fallback to en-US
-        for lang in ['en-IN', 'en-US']:
-            params = urllib.parse.urlencode({
-                'client': 'chromium',
-                'lang': lang,
-                'key': 'AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw',
-                'pFilter': 0
-            })
-            url = f'http://www.google.com/speech-api/v2/recognize?{params}'
-            headers = {'Content-Type': 'audio/x-flac; rate=16000'}
+        # Query Google Speech Recognition v2 with configured language
+        params = urllib.parse.urlencode({
+            'client': 'chromium',
+            'lang': lang_bcp,
+            'key': '«redacted:AIza…»',
+            'pFilter': 0
+        })
+        url = f'http://www.google.com/speech-api/v2/recognize?{params}'
+        headers = {'Content-Type': 'audio/x-flac; rate=16000'}
 
-            req = urllib.request.Request(url, data=flac_bytes, headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    body = resp.read().decode('utf-8')
-                    transcripts = []
-                    for line in body.splitlines():
-                        if line.strip():
-                            try:
-                                data = json.loads(line)
-                                for res in data.get('result', []):
-                                    for alt in res.get('alternative', []):
-                                        t = alt.get('transcript', '').strip()
-                                        if t:
-                                            transcripts.append(t)
-                            except Exception:
-                                pass
-                    if transcripts:
-                        best = transcripts[0]
-                        print(f'[STT:Google] Transcribed ({lang}) in {time.time() - t_start:.2f}s: "{best}"')
-                        return best
-            except Exception as net_err:
-                print(f"[STT:Google] Network request error ({lang}): {net_err}")
+        req = urllib.request.Request(url, data=flac_bytes, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode('utf-8')
+                transcripts = []
+                for line in body.splitlines():
+                    if line.strip():
+                        try:
+                            data = json.loads(line)
+                            for res in data.get('result', []):
+                                for alt in res.get('alternative', []):
+                                    t = alt.get('transcript', '').strip()
+                                    if t:
+                                        transcripts.append(t)
+                        except Exception:
+                            pass
+                if transcripts:
+                    best = transcripts[0]
+                    print(f'[STT:Google] Transcribed ({lang_bcp}) in {time.time() - t_start:.2f}s: \"{best}\"')
+                    return best
+        except Exception as net_err:
+            print(f"[STT:Google] Network request error ({lang_bcp}): {net_err}")
 
         print(f"[STT:Google] No speech recognized in {duration_sec:.2f}s audio clip.")
     except Exception as e:
@@ -402,7 +466,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         filename = audio.filename or "recording.webm"
         print(f"\n[MIC] Received audio: {filename} ({len(audio_bytes)} bytes)")
         
-        text = await asyncio.to_thread(transcribe_audio_bytes, audio_bytes, filename)
+        text = await asyncio.to_thread(transcribe_audio_bytes, audio_bytes, filename, LANGUAGE)
         return {"status": "success", "text": text}
     except Exception as e:
         print(f"Transcription Error: {e}")
@@ -423,6 +487,7 @@ async def chat_with_friday(req: ChatRequest):
         # Asynchronously extract and persist durable memory entities in the background without adding latency
         asyncio.create_task(asyncio.to_thread(remember_user_statement, message))
         
+        agent_elapsed = 0.0
         # Fast path for simple greetings (hi, hello, hey, etc.)
         clean_msg = re.sub(r'[^\w\s]', '', message.strip().lower())
         greeting_words = ["hi", "hello", "hey", "hi sylphya", "hello sylphya", "hey sylphya", "hi friday", "hello friday", "hey friday", "hi there", "hello there", "hey there"]
@@ -450,9 +515,10 @@ async def chat_with_friday(req: ChatRequest):
             # Run the native ReAct agent with multi-model fallback (Mistral -> Gemini -> Groq)
             result = None
             last_agent_error = None
+            agent_start = time.time()
 
             if not CANDIDATE_MODEL_CONFIGS:
-                reply_text = "Please set MISTRAL_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env."
+                reply_text = "Please set HERMES_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env."
                 reply_emotion = "concerned"
                 result = {"messages": [AIMessage(content=json.dumps({"text": reply_text, "emotion": reply_emotion, "intensity": 0.8}))]}
             else:
@@ -473,6 +539,9 @@ async def chat_with_friday(req: ChatRequest):
                         last_agent_error = model_err
                         print(f"[AGENT FALLBACK] {provider}:{candidate_model} error: {err_text[:140]}")
                         continue
+
+            agent_elapsed = time.time() - agent_start
+            print(f"[TIMING] Agent call: {agent_elapsed:.2f}s")
 
             if result is None:
                 if last_agent_error:
@@ -517,12 +586,22 @@ async def chat_with_friday(req: ChatRequest):
                     tool_records.append({"name": tool_name, "args": tool_args, "result": tool_result})
                     print(f"[TOOL EXECUTED] {tool_name}({tool_args}) -> {tool_result[:80]}")
         
-        # Fast TTS Synthesis (Siri on macOS / Edge-TTS)
-        t0 = time.time()
-        file_name, audio_chunks = await synthesize_speech(reply_text)
-        t_tts = time.time() - t0
+        # Auto-mute: skip TTS when the user's media is playing
+        muted = False
+        if await asyncio.to_thread(is_system_audio_playing):
+            muted = True
+            print(f"[MUTE-GUARD] System audio active — suppressing voice for: \"{reply_text[:60]}\"")
+
+        # Fast TTS Synthesis (Edge-TTS)
+        t_tts_start = time.time()
+        if muted:
+            file_name, audio_chunks = "", b""
+        else:
+            file_name, audio_chunks = await synthesize_speech(reply_text, reply_emotion, reply_intensity)
+        t_tts = time.time() - t_tts_start
         audio_b64 = base64.b64encode(audio_chunks).decode("utf-8") if audio_chunks else None
-        t_total = t_tts
+        t_total = agent_elapsed + t_tts
+        print(f"[TIMING] TTS: {t_tts:.2f}s, Total: {t_total:.2f}s")
         
         # Log interaction for ML self-improvement
         used_provider = locals().get('provider', 'builtin')
@@ -539,9 +618,10 @@ async def chat_with_friday(req: ChatRequest):
             "text": reply_text,
             "emotion": reply_emotion,
             "intensity": reply_intensity,
-            "audio_url": f"http://localhost:8000/audio/{file_name}",
+            "muted": muted,
+            "audio_url": f"http://localhost:8000/audio/{file_name}" if file_name else None,
             "audio_base64": audio_b64,
-            "filename": file_name,
+            "filename": file_name or None,
             "tool_calls": tool_records
         }
         
@@ -649,7 +729,7 @@ async def voice_websocket(websocket: WebSocket):
                     # Client finished recording, transcribe buffered audio
                     if len(audio_buffer) > 300:
                         try:
-                            text = await asyncio.to_thread(transcribe_audio_bytes, bytes(audio_buffer), "recording.webm")
+                            text = await asyncio.to_thread(transcribe_audio_bytes, bytes(audio_buffer), "recording.webm", LANGUAGE)
                             audio_buffer.clear()
                             await websocket.send_json({"type": "transcript", "text": text})
                             print(f"[WS-STT] Transcribed: '{text}'")
@@ -683,7 +763,7 @@ async def voice_websocket(websocket: WebSocket):
                         
                         result = None
                         if not CANDIDATE_MODEL_CONFIGS:
-                            reply_text = "Please set MISTRAL_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env."
+                            reply_text = "Please set HERMES_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env."
                             reply_emotion = "concerned"
                             result = {"messages": [AIMessage(content=json.dumps({"text": reply_text, "emotion": reply_emotion}))]}
                         else:
@@ -735,23 +815,21 @@ async def voice_websocket(websocket: WebSocket):
                             "emotion": reply_emotion,
                             "intensity": reply_intensity,
                         })
-                        
-                        # Stream TTS audio chunks to frontend
+
+                        # Auto-mute: stay silent while the user's media plays
+                        if await asyncio.to_thread(is_system_audio_playing):
+                            print(f"[MUTE-GUARD] System audio active — skipping voice for: \"{reply_text[:60]}\"")
+                            await websocket.send_json({"type": "audio_end", "muted": True})
+                            continue
+
+                        # Stream Edge-TTS audio chunks to frontend
                         chunk_count = 0
-                        if TTS_ENGINE == "siri" and sys.platform == "darwin":
-                            siri_bytes = await asyncio.to_thread(synthesize_siri_wav_sync, reply_text, SIRI_VOICE, SIRI_RATE)
-                            if siri_bytes:
-                                chunk_size = 16384
-                                for i in range(0, len(siri_bytes), chunk_size):
-                                    await websocket.send_bytes(siri_bytes[i:i+chunk_size])
-                                    chunk_count += 1
-                        if chunk_count == 0:
-                            clean_tts = clean_for_speech(reply_text)
-                            communicate = edge_tts.Communicate(clean_tts, "en-GB-SoniaNeural", rate="+15%")
-                            async for chunk in communicate.stream():
-                                if chunk["type"] == "audio":
-                                    await websocket.send_bytes(chunk["data"])
-                                    chunk_count += 1
+                        clean_tts = clean_for_speech(reply_text)
+                        communicate = edge_tts.Communicate(clean_tts, EDGE_VOICE, rate=EDGE_RATE, pitch="+0Hz")
+                        async for chunk in communicate.stream():
+                            if chunk["type"] == "audio":
+                                await websocket.send_bytes(chunk["data"])
+                                chunk_count += 1
                         
                         # Signal end of audio stream
                         await websocket.send_json({"type": "audio_end"})
@@ -818,14 +896,20 @@ def cleanup_spoken_audio_endpoint():
 @app.get("/api/health")
 def health_check():
     from memory.fast_extractor import is_available as fast_ext_ok
+    primary = "hermes" if (HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE)) else ("mistral" if os.getenv("MISTRAL_API_KEY") else ("gemini" if os.getenv("GEMINI_API_KEY") else "groq"))
     return {
         "status": "ok",
         "backend": "python",
         "orchestration": "native-react",
-        "primary_llm": "mistral" if os.getenv("MISTRAL_API_KEY") else "gemini",
+        "primary_llm": primary,
+        "hermes_enabled": HERMES_ENABLED,
+        "hermes_model": HERMES_MODEL,
+        "hermes_api_base": HERMES_API_BASE,
+        "hermes_key_set": bool(HERMES_API_KEY),
         "stt_engine": "groq_whisper_large_v3_turbo" if os.getenv("GROQ_API_KEY") else "local_faster_whisper",
-        "tts_engine": f"siri_{SIRI_VOICE.lower()}" if TTS_ENGINE == "siri" else "edge_tts_streaming",
-        "voice": SIRI_VOICE if TTS_ENGINE == "siri" else "en-GB-SoniaNeural",
+        "language": LANGUAGE,
+        "tts_engine": "edge_tts_streaming",
+        "voice": EDGE_VOICE,
         "ws_voice": "ws://localhost:8000/ws/voice",
         "semantic_memory": False,
         "fast_extractor": fast_ext_ok(),
@@ -837,50 +921,31 @@ def health_check():
         "feedback_stats": feedback_stats(),
     }
 
-class VoiceSelectRequest(BaseModel):
-    engine: str = "siri"  # "siri" or "edge"
-    voice: str = "Samantha"
-
 @app.get("/api/voices")
 def get_available_voices():
-    """List available voices (macOS Siri voices + Edge-TTS)"""
-    voices = []
-    if sys.platform == "darwin":
-        try:
-            res = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=3)
-            for line in res.stdout.splitlines():
-                if "#" in line:
-                    parts = line.split("#")[0].strip().rsplit(None, 1)
-                    if len(parts) == 2:
-                        name, locale = parts[0].strip(), parts[1].strip()
-                        if locale.startswith("en"):
-                            is_siri = name in ["Samantha", "Daniel", "Karen", "Rishi", "Ava", "Allison", "Tom", "Siri"]
-                            voices.append({"id": name, "name": f"{name} ({locale})", "engine": "siri", "is_siri": is_siri})
-        except Exception:
-            pass
-    voices.extend([
-        {"id": "en-GB-SoniaNeural", "name": "Sonia (UK Neural)", "engine": "edge", "is_siri": False},
-        {"id": "en-US-AriaNeural", "name": "Aria (US Neural)", "engine": "edge", "is_siri": False},
-        {"id": "en-US-GuyNeural", "name": "Guy (US Neural)", "engine": "edge", "is_siri": False},
-    ])
+    """List available Edge-TTS voices"""
+    voices = [
+        {"id": "en-GB-SoniaNeural", "name": "Sonia (UK Neural)", "engine": "edge"},
+        {"id": "en-IN-AriaNeural", "name": "Aria (US Neural)", "engine": "edge"},
+        {"id": "en-IN-GuyNeural", "name": "Guy (US Neural)", "engine": "edge"},
+    ]
     return {
         "status": "success",
-        "current_engine": TTS_ENGINE,
-        "current_voice": SIRI_VOICE if TTS_ENGINE == "siri" else "en-GB-SoniaNeural",
+        "current_engine": "edge",
+        "current_voice": EDGE_VOICE,
         "voices": voices
     }
 
 @app.post("/api/voice/select")
 def select_voice(req: VoiceSelectRequest):
-    """Switch TTS engine and voice dynamically"""
-    global TTS_ENGINE, SIRI_VOICE
-    TTS_ENGINE = req.engine.strip().lower()
-    SIRI_VOICE = req.voice.strip()
-    print(f"[VOICE] Switched TTS engine to '{TTS_ENGINE}' with voice '{SIRI_VOICE}'")
+    """Switch Edge-TTS voice dynamically"""
+    global EDGE_VOICE
+    EDGE_VOICE = req.voice.strip()
+    print(f"[VOICE] Switched Edge-TTS voice to '{EDGE_VOICE}'")
     return {
         "status": "success",
-        "current_engine": TTS_ENGINE,
-        "current_voice": SIRI_VOICE
+        "current_engine": "edge",
+        "current_voice": EDGE_VOICE
     }
 
 # =========================================================
