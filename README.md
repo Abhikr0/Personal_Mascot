@@ -101,6 +101,19 @@ cd web
 npm run build:exe
 ```
 
+### 6. Running with Docker Compose
+To run the full stack (FastAPI Backend + Web Frontend) in Docker:
+```bash
+docker compose up --build
+```
+- **Web Frontend**: [http://localhost:3000](http://localhost:3000)
+- **FastAPI Backend**: [http://localhost:8000](http://localhost:8000) (Docs at `/docs`)
+
+To run only the backend in Docker (useful when running the Electron desktop mascot natively on the host):
+```bash
+docker compose up -d backend
+```
+
 ---
 ## Reference video 
 

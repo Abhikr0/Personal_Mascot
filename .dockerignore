@@ -1,0 +1,28 @@
+# Python build artifacts and virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+*.spec
+
+# Frontend dependencies and builds (handled in web context)
+web/node_modules/
+web/dist/
+web/dist-electron/
+web/electron-cache/
+web/release/
+
+# Git and OS metadata
+.git/
+.gitignore
+.DS_Store
+Thumbs.db
+
+# Media & temporary files
+*.webm
+

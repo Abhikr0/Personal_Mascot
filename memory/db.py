@@ -61,6 +61,60 @@ class MemoryDB:
                 );
             """)
 
+
+            # ── Relation knowledge-graph store (subject–predicate–object edges) ─────
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS relations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object TEXT NOT NULL,
+                    date_time TEXT,
+                    context TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT,
+                    UNIQUE(subject, predicate, object)
+                );
+            """)
+
+            # FTS5 for relations
+            cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS relation_fts USING fts5(
+                    subject, predicate, object, date_time, context, content='relations', content_rowid='id'
+                );
+            """)
+
+            # Sync triggers
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS relations_ai AFTER INSERT ON relations BEGIN
+                    INSERT INTO relation_fts(rowid, subject, predicate, object, date_time, context)
+                    VALUES (new.id, new.subject, new.predicate, new.object, new.date_time, new.context);
+                END;
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS relations_ad AFTER DELETE ON relations BEGIN
+                    INSERT INTO relation_fts(relation_fts, rowid, subject, predicate, object, date_time, context)
+                    VALUES ('delete', old.id, old.subject, old.predicate, old.object, old.date_time, old.context);
+                END;
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS relations_au AFTER UPDATE ON relations BEGIN
+                    INSERT INTO relation_fts(relation_fts, rowid, subject, predicate, object, date_time, context)
+                    VALUES ('delete', old.id, old.subject, old.predicate, old.object, old.date_time, old.context);
+                    INSERT INTO relation_fts(rowid, subject, predicate, object, date_time, context)
+                    VALUES (new.id, new.subject, new.predicate, new.object, new.date_time, new.context);
+                END;
+            """)
+
+            # Backfill: add an updated_at column for older database installs
+            try:
+                conn.execute('PRAGMA table_info(relations)')
+                if 'updated_at' not in [r[1] for r in conn.execute('PRAGMA table_info(relations)')]:
+                    conn.execute('ALTER TABLE relations ADD COLUMN updated_at TEXT')
+                    conn.commit()
+            except Exception:
+                pass
+
             # Synchronization triggers for FTS5
             cursor.execute("""
                 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
@@ -217,6 +271,54 @@ class MemoryDB:
                 cursor.execute("DELETE FROM memories WHERE key = ? OR key LIKE ?", (target.lower(), f"%{target.lower()}%"))
             conn.commit()
             return cursor.rowcount > 0
+
+
+    def add_relation(self, subject: str, predicate: str, object_: str, date_time: Optional[str] = None, context: str = "") -> Dict[str, Any]:
+        """Add a typed relation (knowledge-graph edge)."""
+        clean_subj = subject.strip().lower()
+        clean_pred = predicate.strip().lower()
+        clean_obj = object_.strip().lower()
+        clean_dt = date_time.strip() if date_time else None
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO relations (subject, predicate, object, date_time, context, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (clean_subj, clean_pred, clean_obj, clean_dt, context, now_str, now_str),
+            )
+            conn.commit()
+            cursor.execute("SELECT * FROM relations WHERE id = (SELECT last_insert_rowid())")
+            row = cursor.fetchone()
+            return dict(row) if row else {}
+
+    def search_relations(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Full-text search over the relation knowledge graph."""
+        clean_query = query.strip()
+        if not clean_query:
+            return []
+        results = []
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    """SELECT r.*, rank FROM relation_fts f
+                       JOIN relations r ON r.id = f.rowid
+                       WHERE relation_fts MATCH ?
+                       ORDER BY rank LIMIT ?""",
+                    (clean_query, limit),
+                )
+                results = [dict(r) for r in cursor.fetchall()]
+            except Exception:
+                like = f"%{clean_query}%"
+                cursor.execute(
+                    """SELECT * FROM relations
+                       WHERE subject LIKE ? OR predicate LIKE ? OR object LIKE ? OR context LIKE ?
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (like, like, like, like, limit),
+                )
+                results = [dict(r) for r in cursor.fetchall()]
+        return results
 
 
 # Global database instance

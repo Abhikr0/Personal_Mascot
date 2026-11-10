@@ -111,3 +111,34 @@ def extract_fast(text: str) -> List[Dict[str, Any]]:
 def is_available() -> bool:
     """Fast regex extractor is always available with 0 dependencies."""
     return True
+
+
+def extract_relationships(text: str) -> List[tuple]:
+    """Fast local relationship extraction -> [(subject, predicate, object)] tuples."""
+    clean = text.strip()
+    found = []
+    if not clean or len(clean) < 6:
+        return found
+    patterns = [
+        (r"([A-Z][a-z]+)\s+works\s+(?:at|for)\s+([A-Z][a-z]+(?:\.?[a-z]+)?)", "employer"),
+        (r"([A-Z][a-z]+)\s+lives\s+(?:in|near)\s+([A-Z][a-z]+(?:\.?[a-z]+)?)", "location"),
+        (r"([A-Z][a-z]+)\s+likes?\s+(?:to\s+)?([A-Z][a-z]+)", "likes"),
+        (r"([A-Z][a-z]+)\s+hates?\s+(?:to\s+)?([A-Z][a-z]+)", "dislikes"),
+    ]
+    for pattern, pred in patterns:
+        for m in re.finditer(pattern, clean):
+            subj = m.group(1).strip().lower()
+            obj = m.group(2).strip().lower()
+            if subj and obj and subj != obj:
+                found.append((subj, pred, obj))
+    return found
+
+
+def remember_relationships(text: str) -> List[Dict[str, Any]]:
+    """Auto-extract and persist clear relationships into the knowledge graph."""
+    saved = []
+    for subj, pred, obj in extract_relationships(text):
+        record = memory_db.add_relation(subject=subj, predicate=pred, object=obj, context=text)
+        if record:
+            saved.append(record)
+    return saved

@@ -1,0 +1,56 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: friday-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PORT=8000
+      - HOST=0.0.0.0
+      - LANGUAGE=${LANGUAGE:-en-IN}
+      - STT_ENGINE=${STT_ENGINE:-faster_whisper}
+      - LOCAL_WHISPER_MODEL=${LOCAL_WHISPER_MODEL:-base.en}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - HERMES_ENABLED=${HERMES_ENABLED:-true}
+      - HERMES_API_BASE=${HERMES_API_BASE:-http://host.docker.internal:8642/v1}
+      - HERMES_API_KEY=${HERMES_API_KEY:-}
+      - HERMES_MODEL=${HERMES_MODEL:-hermes-agent}
+    volumes:
+      - ./data:/app/data
+      - ./public/audio:/app/public/audio
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: friday-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+

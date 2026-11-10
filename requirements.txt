@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 python-multipart
-edge-tts
+edge-tts>=7.3.1
 python-dotenv
 groq
 google-genai
@@ -10,3 +10,4 @@ pyautogui
 pywin32; sys_platform == 'win32'
 psutil
 mistralai
+faster-whisper

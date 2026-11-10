@@ -10,7 +10,13 @@ Live2DModel.registerTicker(PIXI.Ticker);
 
 import {
   JIAN_CHARACTER,
+  GESTURE_MAP,
+  BODY_MAP,
+  FACE_FX_MAP,
   type AssistantEmotion,
+  type GestureToken,
+  type BodyToken,
+  type FaceEffectToken,
 } from './characters';
 
 type AppState = 'loading' | 'ready' | 'error';
@@ -102,6 +108,11 @@ function App() {
   const listenStateRef = useRef<ListenState>('idle');
   const emotionRef = useRef<AssistantEmotion>('neutral');
   const emotionIntensityRef = useRef<number>(1.0);
+  // Gesture, body posture and face effect refs — driven by LLM response
+  const gestureRef = useRef<GestureToken>('idle');
+  const bodyPostureRef = useRef<BodyToken>('neutral');
+  const faceFxRef = useRef<FaceEffectToken[]>([]);
+  const gestureTimeoutRef = useRef<any>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const isRecordingRef = useRef(false);
   const dragRef = useRef({ isDragging: false, startX: 0, startY: 0, winStartX: 0, winStartY: 0, hasMoved: false });
@@ -154,6 +165,29 @@ function App() {
       emotionTimeoutRef.current = setTimeout(() => {
         emotionRef.current = isSleepingRef.current ? 'sleeping' : 'neutral';
       }, durationMs);
+    }
+  }, []);
+
+  // Update gesture + optionally auto-reset it after the reply finishes (called with 0 to persist)
+  const updateGesture = useCallback((
+    gesture: GestureToken,
+    body: BodyToken,
+    faceFx: FaceEffectToken[],
+    resetAfterMs = 0,
+  ) => {
+    gestureRef.current = gesture;
+    bodyPostureRef.current = body;
+    faceFxRef.current = faceFx;
+    if (gestureTimeoutRef.current) {
+      clearTimeout(gestureTimeoutRef.current);
+      gestureTimeoutRef.current = null;
+    }
+    if (resetAfterMs > 0) {
+      gestureTimeoutRef.current = setTimeout(() => {
+        gestureRef.current = 'idle';
+        bodyPostureRef.current = 'neutral';
+        faceFxRef.current = [];
+      }, resetAfterMs);
     }
   }, []);
 
@@ -252,10 +286,10 @@ function App() {
   }, [deleteSpokenAudioFile]);
 
   // Unified helper to reset listening state, emotion and restart Always-On
-  const setIdleState = useCallback((emotion: AssistantEmotion = 'neutral', restartDelayMs?: number) => {
+  const setIdleState = useCallback((emotion: AssistantEmotion = 'neutral', restartDelayMs?: number, durationMs = 12000) => {
     listenStateRef.current = 'idle';
     setListenState('idle');
-    updateEmotion(isSleepingRef.current ? 'sleeping' : emotion);
+    updateEmotion(isSleepingRef.current ? 'sleeping' : emotion, durationMs);
     if (restartDelayMs !== undefined && alwaysOnRef.current) {
       scheduleRestartListening(restartDelayMs);
     }
@@ -450,6 +484,25 @@ function App() {
         const baseParams = char.emotionMap[activeEmotion] || char.emotionMap['neutral'];
         const targetParams: Record<string, number> = { ...baseParams };
 
+        // Apply face effect overlays from LLM (additive on top of emotion base)
+        const activeFaceFx = faceFxRef.current;
+        for (const fxToken of activeFaceFx) {
+          const fxParams = FACE_FX_MAP[fxToken];
+          if (fxParams) {
+            for (const [k, v] of Object.entries(fxParams)) {
+              // Clamp-merge: take the stronger of emotion base or fx value
+              targetParams[k] = Math.min(1, Math.max(targetParams[k] ?? 0, v));
+            }
+          }
+        }
+
+        // Apply gesture params from LLM (overlay on top of emotion + face_fx)
+        const activeGesture = gestureRef.current || 'idle';
+        const gestureParams = GESTURE_MAP[activeGesture] || {};
+        for (const [k, v] of Object.entries(gestureParams)) {
+          targetParams[k] = v;
+        }
+
         // Desktop / Cursor tracking with origin at (WIN_W / 2, 180)
         const dx = cursorPosRef.current.x - (WIN_W / 2);
         const dy = cursorPosRef.current.y - 180;
@@ -505,14 +558,19 @@ function App() {
           }
         }
 
-        // Cheerful micro-expressions during idle
+        // Organic micro-expressions during idle (preserve negative/serious emotions without forcing a smile)
         if (currState === 'idle' && !isSleep) {
           const cheerfulBreath = Math.sin(t * 1.8) * 0.08;
-          targetParams.ParamMouthForm = Math.min(1, Math.max(0.5, (targetParams.ParamMouthForm ?? 0.85) + cheerfulBreath));
-          targetParams.ParamEyeLSmile = Math.min(1, Math.max(0.3, (targetParams.ParamEyeLSmile ?? 0.65) + cheerfulBreath * 0.4));
-          targetParams.ParamEyeRSmile = Math.min(1, Math.max(0.3, (targetParams.ParamEyeRSmile ?? 0.65) + cheerfulBreath * 0.4));
-          targetParams.ParamSwitch2 = Math.min(1, Math.max(0.2, (targetParams.ParamSwitch2 ?? 0.35) + Math.sin(t * 1.2) * 0.06));
-          targetParams.Ear_smile = Math.min(1, Math.max(0.1, (targetParams.Ear_smile ?? 0.25) + Math.sin(t * 1.0) * 0.12));
+          const isCheerfulIdle = activeEmotion === 'neutral' || activeEmotion === 'happy' || activeEmotion === 'loving' || activeEmotion === 'adoring' || activeEmotion === 'excited' || activeEmotion === 'playful' || activeEmotion === 'starstruck';
+          if (isCheerfulIdle) {
+            targetParams.ParamMouthForm = Math.min(1, Math.max(0.5, (targetParams.ParamMouthForm ?? 0.85) + cheerfulBreath));
+            targetParams.ParamEyeLSmile = Math.min(1, Math.max(0.3, (targetParams.ParamEyeLSmile ?? 0.65) + cheerfulBreath * 0.4));
+            targetParams.ParamEyeRSmile = Math.min(1, Math.max(0.3, (targetParams.ParamEyeRSmile ?? 0.65) + cheerfulBreath * 0.4));
+            targetParams.ParamSwitch2 = Math.min(1, Math.max(0.2, (targetParams.ParamSwitch2 ?? 0.35) + Math.sin(t * 1.2) * 0.06));
+            targetParams.Ear_smile = Math.min(1, Math.max(0.1, (targetParams.Ear_smile ?? 0.25) + Math.sin(t * 1.0) * 0.12));
+          } else {
+            targetParams.Ear_smile = Math.min(1, Math.max(-1, (targetParams.Ear_smile ?? 0) + Math.sin(t * 1.0) * 0.06));
+          }
         }
 
         if (char.switchIds) {
@@ -576,12 +634,84 @@ function App() {
           if (!nodActiveRef.current) nodPhaseRef.current = 0;
 
           const intensityScale = 0.8 + (emotionIntensityRef.current ?? 1.0) * 0.5;
-          pBodyAngleX = (Math.sin(t * 1.2) * 4.0 + Math.sin(t * 2.1) * 2.0 + c.smoothBodyX * 0.6) * intensityScale;
-          pBodyAngleZ = Math.sin(t * 1.0 + 1) * 3.0 * intensityScale;
-          pAngleX = (Math.sin(t * 1.6) * 4.5 + c.smoothAngleX * 0.7) * intensityScale + nodOffset;
-          pAngleY = (Math.sin(t * 1.8) * 5.0 + mouthEnergy * -4.0 + c.smoothAngleY * 0.7) * intensityScale;
-          pAngleZ = (Math.sin(t * 1.3 + 0.5) * 4.5 + c.smoothAngleZ * 0.7) * intensityScale;
-          pShoulder = mouthEnergy * 0.5 + Math.sin(t * 2.5) * 0.25;
+
+          // ── Emotion-aware speaking body motion ───────────────────────────
+          if (activeEmotion === 'excited' || activeEmotion === 'starstruck' || activeEmotion === 'overwhelmed') {
+            // Fast bouncy, big arm energy, high amplitude
+            pBodyAngleX = (Math.sin(t * 2.8) * 6.0 + Math.sin(t * 3.5) * 2.5 + c.smoothBodyX * 0.6) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 2.2) * 5.0 * intensityScale;
+            pAngleX = (Math.sin(t * 2.4) * 6.0 + c.smoothAngleX * 0.6) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 2.8) * 6.0 + mouthEnergy * -5.0 + c.smoothAngleY * 0.6) * intensityScale;
+            pAngleZ = (Math.sin(t * 2.0 + 0.5) * 5.5 + c.smoothAngleZ * 0.6) * intensityScale;
+            pShoulder = mouthEnergy * 0.7 + Math.sin(t * 3.5) * 0.35;
+          } else if (activeEmotion === 'playful' || activeEmotion === 'smug') {
+            // Exaggerated hip sway, cheeky bounce, loose
+            pBodyAngleX = (Math.sin(t * 1.6) * 5.0 + Math.sin(t * 3.2) * 2.0 + c.smoothBodyX * 0.7) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 1.4 + 1) * 5.5 * intensityScale;
+            pAngleX = (Math.sin(t * 1.8) * 5.0 + c.smoothAngleX * 0.7) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 2.0) * 5.5 + mouthEnergy * -4.0 + c.smoothAngleY * 0.7) * intensityScale;
+            pAngleZ = (Math.sin(t * 1.5 + 0.5) * 5.0 + c.smoothAngleZ * 0.7) * intensityScale;
+            pShoulder = mouthEnergy * 0.4 + Math.sin(t * 2.8) * 0.3;
+          } else if (activeEmotion === 'concerned' || activeEmotion === 'sad') {
+            // Slow, hunched, tight, inward
+            pBodyAngleX = (Math.sin(t * 0.9) * 2.5 + c.smoothBodyX * 0.4) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 0.7 + 1) * 2.0 * intensityScale;
+            pAngleX = (Math.sin(t * 1.0) * 2.5 + c.smoothAngleX * 0.5) * intensityScale + nodOffset * 0.5;
+            pAngleY = (Math.sin(t * 1.1) * 2.5 + mouthEnergy * -2.0 + c.smoothAngleY * 0.5) * intensityScale;
+            pAngleZ = (Math.sin(t * 0.8 + 0.5) * 2.5 + c.smoothAngleZ * 0.5) * intensityScale;
+            pShoulder = mouthEnergy * 0.2 + Math.sin(t * 1.5) * 0.1;
+          } else if (activeEmotion === 'angry' || activeEmotion === 'annoyed' || activeEmotion === 'tsundere') {
+            // Stiff, sharp snapping motions, forward lean
+            pBodyAngleX = (Math.sin(t * 2.0) * 4.0 + c.smoothBodyX * 0.5) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 1.8 + 1) * 2.5 * intensityScale;
+            pAngleX = (Math.sin(t * 2.2) * 4.5 + c.smoothAngleX * 0.5) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 2.0) * 4.0 + mouthEnergy * -3.0 + c.smoothAngleY * 0.5) * intensityScale;
+            pAngleZ = (Math.sin(t * 1.8 + 0.5) * 3.0 + c.smoothAngleZ * 0.5) * intensityScale;
+            pShoulder = mouthEnergy * 0.4 + Math.sin(t * 2.5) * 0.2;
+          } else if (activeEmotion === 'scared') {
+            // Trembling small motions, pulling back
+            const tremble = Math.sin(t * 14) * 0.3 * intensityScale;
+            pBodyAngleX = (Math.sin(t * 2.5) * 2.0 + tremble + c.smoothBodyX * 0.3) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 2.2 + 1) * 2.5 * intensityScale + tremble;
+            pAngleX = (-4 + Math.sin(t * 2.5) * 2.5 + tremble + c.smoothAngleX * 0.4) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 2.2) * 3.0 + mouthEnergy * -3.0 + c.smoothAngleY * 0.4) * intensityScale;
+            pAngleZ = (Math.sin(t * 2.0 + 0.5) * 2.5 + tremble + c.smoothAngleZ * 0.4) * intensityScale;
+            pShoulder = mouthEnergy * 0.3 + tremble * 0.5;
+          } else if (activeEmotion === 'loving' || activeEmotion === 'adoring') {
+            // Gentle dreamy sway, soft and slow
+            pBodyAngleX = (Math.sin(t * 0.8) * 2.5 + Math.sin(t * 1.4) * 1.0 + c.smoothBodyX * 0.5) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 0.7 + 1) * 2.5 * intensityScale;
+            pAngleX = (Math.sin(t * 1.0) * 3.0 + c.smoothAngleX * 0.6) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 1.2) * 3.5 + mouthEnergy * -2.5 + c.smoothAngleY * 0.6) * intensityScale;
+            pAngleZ = (Math.sin(t * 0.9 + 0.5) * 3.0 + c.smoothAngleZ * 0.6) * intensityScale;
+            pShoulder = mouthEnergy * 0.3 + Math.sin(t * 1.4) * 0.15;
+          } else if (activeEmotion === 'bored') {
+            // Minimal motion, sluggish
+            pBodyAngleX = (Math.sin(t * 0.5) * 1.5 + c.smoothBodyX * 0.3) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 0.4 + 1) * 1.2 * intensityScale;
+            pAngleX = (Math.sin(t * 0.6) * 2.0 + c.smoothAngleX * 0.4) * intensityScale + nodOffset * 0.3;
+            pAngleY = (Math.sin(t * 0.5) * 2.0 + mouthEnergy * -1.5 + c.smoothAngleY * 0.4) * intensityScale;
+            pAngleZ = (Math.sin(t * 0.4 + 0.5) * 1.5 + c.smoothAngleZ * 0.4) * intensityScale;
+            pShoulder = mouthEnergy * 0.1 + Math.sin(t * 0.9) * 0.08;
+          } else {
+            // Default speaking motion (happy, neutral, thinking, surprised, curious, embarrassed)
+            pBodyAngleX = (Math.sin(t * 1.2) * 4.0 + Math.sin(t * 2.1) * 2.0 + c.smoothBodyX * 0.6) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 1.0 + 1) * 3.0 * intensityScale;
+            pAngleX = (Math.sin(t * 1.6) * 4.5 + c.smoothAngleX * 0.7) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 1.8) * 5.0 + mouthEnergy * -4.0 + c.smoothAngleY * 0.7) * intensityScale;
+            pAngleZ = (Math.sin(t * 1.3 + 0.5) * 4.5 + c.smoothAngleZ * 0.7) * intensityScale;
+            pShoulder = mouthEnergy * 0.5 + Math.sin(t * 2.5) * 0.25;
+          }
+
+          // ── Body posture token blends on top of speaking motion ──────────
+          const posture = BODY_MAP[bodyPostureRef.current] || BODY_MAP['neutral'];
+          const procedural = 1 - posture.rigidBlend;
+          const tremble = posture.trembleAmp > 0 ? Math.sin(t * 16) * posture.trembleAmp * intensityScale : 0;
+          pAngleX = pAngleX * procedural + posture.angleXBias * posture.rigidBlend + tremble;
+          pAngleY = pAngleY * procedural + posture.angleYBias * posture.rigidBlend;
+          pBodyAngleX = pBodyAngleX * procedural * posture.bodyXMul + tremble;
+          pBodyAngleZ = pBodyAngleZ * procedural * posture.bodyZMul + tremble * 0.5;
+
         } else if (currState === 'listening') {
           // Attentive listening posture: tilted head with curiosity
           pAngleX = 10 + Math.sin(t * 1.2) * 2.5 + c.smoothAngleX * 0.7;
@@ -594,11 +724,16 @@ function App() {
           coreModel.setParameterValueById('ParamEyeROpen', 1.2);
         } else {
           // Dynamic Idle Motion: organic sway, head movement, and breathing
-          pBodyAngleX = Math.sin(t * 1.2) * 3.0 + Math.sin(t * 0.7) * 1.8 + c.smoothBodyX;
-          pBodyAngleZ = Math.sin(t * 0.9 + 1) * 2.2 + Math.tanh(-dx / 280) * 3;
-          pAngleX = Math.sin(t * 1.4) * 4.0 + Math.sin(t * 0.6) * 2.0 + c.smoothAngleX;
-          pAngleY = Math.sin(t * 1.8) * 3.0 + Math.cos(t * 0.9) * 2.0 + c.smoothAngleY;
-          pAngleZ = Math.sin(t * 1.1) * 3.5 + c.smoothAngleZ;
+          // Apply body posture token to idle too
+          const posture = BODY_MAP[bodyPostureRef.current] || BODY_MAP['neutral'];
+          const procedural = 1 - posture.rigidBlend;
+          const tremble = posture.trembleAmp > 0 ? Math.sin(t * 16) * posture.trembleAmp : 0;
+
+          pBodyAngleX = (Math.sin(t * 1.2) * 3.0 * posture.bodyXMul + Math.sin(t * 0.7) * 1.8 + c.smoothBodyX + tremble) * procedural + posture.angleXBias * posture.rigidBlend;
+          pBodyAngleZ = (Math.sin(t * 0.9 + 1) * 2.2 * posture.bodyZMul + Math.tanh(-dx / 280) * 3 + tremble * 0.5) * procedural;
+          pAngleX = (Math.sin(t * 1.4) * 4.0 + Math.sin(t * 0.6) * 2.0 + c.smoothAngleX + tremble) * procedural + posture.angleXBias * posture.rigidBlend;
+          pAngleY = (Math.sin(t * 1.8) * 3.0 + Math.cos(t * 0.9) * 2.0 + c.smoothAngleY + posture.angleYBias) * procedural;
+          pAngleZ = (Math.sin(t * 1.1) * 3.5 + c.smoothAngleZ) * procedural;
           pShoulder = Math.sin(t * 2) * 0.15;
         }
 
@@ -692,8 +827,10 @@ function App() {
     if (isGreeting) {
       showSubtitle('Hello!', 5000);
       updateEmotion('happy', 15000);
+      updateGesture('wave_right', 'lean_forward', ['blush'], 8000);
     } else {
       updateEmotion('thinking', 0);
+      updateGesture('idle', 'neutral', [], 0);
     }
 
     let data: any = null;
@@ -711,10 +848,17 @@ function App() {
       const intensity = typeof data.intensity === 'number' ? Math.max(0.1, Math.min(1.0, data.intensity)) : 1.0;
       emotionIntensityRef.current = intensity;
       updateEmotion(emotion, 15000);
+
+      // Apply LLM-driven gesture, body posture and face FX (auto-reset after 18s)
+      const gesture = (data.gesture || 'idle') as GestureToken;
+      const body = (data.body || 'neutral') as BodyToken;
+      const faceFx = Array.isArray(data.face_fx) ? data.face_fx as FaceEffectToken[] : [];
+      updateGesture(gesture, body, faceFx, 18000);
+
       setLastReplyText(data.text || null);
       setIsMuted(!!data.muted);
 
-      // Auto-muted while the user's music/video is playing: show text only, no voice
+      // Auto-muted while the user's music/video is playing (or TTS unavailable): show text + keep emotion/gesture briefly
       if (data.muted || (!data.audio_base64 && !data.audio_url) || !modelRef.current) {
         setIsMuted(!!data.muted);
         showSubtitle(
@@ -723,7 +867,8 @@ function App() {
             : data.text || (isGreeting ? 'Hello!' : null),
           6000,
         );
-        setIdleState('happy', 600);
+        setIdleState(emotion, 600, 6000);
+        updateGesture(gesture, body, faceFx, 4000);
         if (alwaysOnRef.current) {
           refreshActiveConversationWindow(25000);
         }
@@ -814,7 +959,9 @@ function App() {
         };
         smoothlyCloseMouth();
 
-        setIdleState('neutral', 600);
+        // Keep expression lingering briefly after speech finishes, then fade smoothly to neutral/idle
+        setIdleState(emotion, 600, 4500);
+        updateGesture(gesture, body, faceFx, 2500);
         showSubtitle(data.text || (isGreeting ? 'Hello!' : null), 5000);
         setShowFeedback(true);
 
@@ -994,7 +1141,14 @@ function App() {
       listenStateRef.current = 'listening';
       setListenState('listening');
 
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      // Use efficient opus compression at 32kbps mono for lowest transmission latency
+      const supportedMime = typeof MediaRecorder.isTypeSupported === 'function' && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: supportedMime,
+        audioBitsPerSecond: 32000,
+      });
       mediaRecorderRef.current = mediaRecorder;
       const audioChunks: Blob[] = [];
 
@@ -1008,8 +1162,9 @@ function App() {
       let silentFrames = 0;
       let speechFrames = 0;
       let hasSpoken = false;
-      const SILENCE_THRESHOLD = 10;
-      const SILENCE_FRAMES_TO_STOP = alwaysOnRef.current ? 15 : 20; // 1.2s to 1.6s of silence before stopping
+      const SILENCE_THRESHOLD = 12;
+      // 7-8 frames * 80ms = ~560-640ms natural pause before cutting (cuts ~900ms off dead wait)
+      const SILENCE_FRAMES_TO_STOP = alwaysOnRef.current ? 7 : 8;
 
       console.log(`[MIC] Started recording (Mode: ${alwaysOnRef.current ? 'Always-On' : 'Push-to-Talk'})`);
 
@@ -1117,7 +1272,7 @@ function App() {
         }
       };
 
-      mediaRecorder.start(250);
+      mediaRecorder.start(100);
 
       const vadInterval = setInterval(() => {
         analyser.getByteFrequencyData(dataArray);
@@ -1127,8 +1282,8 @@ function App() {
           hasSpoken = true;
           speechFrames++;
           silentFrames = 0;
-        } else if (hasSpoken && speechFrames >= 5) {
-          // Only count silence after at least ~400ms of active speech has been captured
+        } else if (hasSpoken && speechFrames >= 4) {
+          // Only count silence after ~320ms of active speech has been captured
           silentFrames++;
           if (silentFrames >= SILENCE_FRAMES_TO_STOP) {
             clearInterval(vadInterval);

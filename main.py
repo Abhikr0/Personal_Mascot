@@ -135,25 +135,54 @@ def _emotion_to_tts_params(emotion: str, intensity: float = 1.0) -> tuple[str, s
     base_rate, base_pitch = EDGE_RATE, "+0Hz"
     emo = (emotion or "neutral").lower()
 
-    if emo in ("happy", "excited", "loving"):
+    if emo in ("happy", "excited", "starstruck"):
         rate_delta = "+" + str(round(10 + 15 * intensity)) + "%"
         pitch_delta = "+" + str(round(2 + 3 * intensity)) + "Hz"
         return rate_delta, pitch_delta
+    if emo in ("loving", "adoring"):
+        # Warm, gentle, affectionate cadence
+        rate_delta = "+" + str(round(2 + 6 * intensity)) + "%"
+        pitch_delta = "+" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "overwhelmed":
+        rate_delta = "+" + str(round(8 + 12 * intensity)) + "%"
+        pitch_delta = "+" + str(round(3 + 4 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
     if emo in ("thinking", "curious"):
         rate_delta = "-" + str(round(3 + 7 * intensity)) + "%"
-        pitch_delta = "-" + str(round(1 + 2 * intensity)) + "Hz"
+        pitch_delta = ("+" if emo == "curious" else "-") + str(round(1 + 2 * intensity)) + "Hz"
         return rate_delta, pitch_delta
     if emo in ("concerned", "embarrassed"):
         rate_delta = "-" + str(round(5 + 8 * intensity)) + "%"
         pitch_delta = "-" + str(round(2 + 3 * intensity)) + "Hz"
         return rate_delta, pitch_delta
+    if emo == "sad":
+        rate_delta = "-" + str(round(10 + 10 * intensity)) + "%"
+        pitch_delta = "-" + str(round(3 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
     if emo == "annoyed":
         rate_delta = "-" + str(round(4 + 6 * intensity)) + "%"
         pitch_delta = "-" + str(round(2 + 4 * intensity)) + "Hz"
         return rate_delta, pitch_delta
+    if emo == "angry":
+        rate_delta = "+" + str(round(4 + 8 * intensity)) + "%"
+        pitch_delta = "-" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "tsundere":
+        rate_delta = "+" + str(round(6 + 10 * intensity)) + "%"
+        pitch_delta = "+" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "scared":
+        rate_delta = "+" + str(round(8 + 12 * intensity)) + "%"
+        pitch_delta = "+" + str(round(4 + 4 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
     if emo == "surprised":
         rate_delta = "+" + str(round(5 + 10 * intensity)) + "%"
         pitch_delta = "+" + str(round(3 + 5 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "bored":
+        rate_delta = "-" + str(round(12 + 10 * intensity)) + "%"
+        pitch_delta = "-" + str(round(3 + 3 * intensity)) + "Hz"
         return rate_delta, pitch_delta
     if emo == "sleeping":
         rate_delta = "-" + str(round(10 + 15 * intensity)) + "%"
@@ -163,8 +192,57 @@ def _emotion_to_tts_params(emotion: str, intensity: float = 1.0) -> tuple[str, s
         rate_delta = "+" + str(round(10 + 18 * intensity)) + "%"
         pitch_delta = "+" + str(round(2 + 4 * intensity)) + "Hz"
         return rate_delta, pitch_delta
+    if emo == "smug":
+        rate_delta = "-" + str(round(2 + 4 * intensity)) + "%"
+        pitch_delta = "+" + str(round(1 + 1 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
     # neutral / default
     return base_rate, base_pitch
+
+
+def _synthesize_macos_say_wav_sync(text: str) -> bytes:
+    """Offline macOS fallback using native `say` + PyAV -> WAV bytes."""
+    if sys.platform != "darwin":
+        return b""
+    import tempfile
+    import av
+    aiff_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tf:
+            aiff_path = tf.name
+        subprocess.run(
+            ["say", "-o", aiff_path, text],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        inp = av.open(aiff_path)
+        out_buf = io.BytesIO()
+        out = av.open(out_buf, mode="w", format="wav")
+        stream = out.add_stream("pcm_s16le", rate=22050)
+        stream.layout = "mono"
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=22050)
+        for frame in inp.decode(audio=0):
+            for r_frame in resampler.resample(frame):
+                for packet in stream.encode(r_frame):
+                    out.mux(packet)
+        for r_frame in resampler.resample(None):
+            for packet in stream.encode(r_frame):
+                out.mux(packet)
+        for packet in stream.encode(None):
+            out.mux(packet)
+        out.close()
+        inp.close()
+        return out_buf.getvalue()
+    except Exception as e:
+        print(f"[TTS:macOS-say] Fallback failed: {e}")
+        return b""
+    finally:
+        if aiff_path and os.path.exists(aiff_path):
+            try:
+                os.remove(aiff_path)
+            except Exception:
+                pass
 
 
 def _tts_cache_key(text: str, voice: str, rate: str, pitch: str) -> str:
@@ -190,8 +268,10 @@ def _save_cached_audio(text: str, voice: str, rate: str, pitch: str, audio_bytes
 
 
 async def synthesize_speech(text: str, emotion: str = "neutral", intensity: float = 1.0) -> tuple[str, bytes]:
-    """Synthesize audio using Edge-TTS with disk cache. Returns: (filename, audio_bytes)"""
+    """Synthesize audio using Edge-TTS with disk cache and local macOS fallback. Returns: (filename, audio_bytes)"""
     spoken_text = get_speakable_text(text)
+    if not spoken_text:
+        return "", b""
     rate, pitch = _emotion_to_tts_params(emotion, intensity)
 
     # Check cache first
@@ -200,7 +280,7 @@ async def synthesize_speech(text: str, emotion: str = "neutral", intensity: floa
         print(f"[TTS-CACHE] Hit: {cached[0]}")
         return cached
 
-    # Synthesize
+    # Synthesize with Edge-TTS
     try:
         t0 = time.time()
         audio_bytes = await synthesize_edge_tts_mp3(spoken_text, EDGE_VOICE, rate, pitch)
@@ -214,6 +294,18 @@ async def synthesize_speech(text: str, emotion: str = "neutral", intensity: floa
             return filename, audio_bytes
     except Exception as e:
         print(f"[TTS:Edge-TTS] Failed: {e}")
+
+    # Offline / fallback synthesis on macOS
+    if sys.platform == "darwin":
+        t0 = time.time()
+        wav_bytes = await asyncio.to_thread(_synthesize_macos_say_wav_sync, spoken_text)
+        if wav_bytes:
+            filename = f"reply_{int(time.time() * 1000)}.wav"
+            filepath = os.path.join(public_audio_dir, filename)
+            with open(filepath, "wb") as f:
+                f.write(wav_bytes)
+            print(f"[AUDIO:macOS-say] Fallback synthesized {filename} in {time.time() - t0:.3f}s ({len(wav_bytes)} bytes)")
+            return filename, wav_bytes
 
     return "", b""
 
@@ -278,6 +370,7 @@ def is_system_audio_playing() -> bool:
 from tools import ALL_FRIDAY_TOOLS
 from memory import (
     memory_db, remember_user_statement, search_memories_semantic,
+    remember_relationships, search_relationships,
     maybe_compress_history, log_interaction, log_feedback, feedback_stats
 )
 
@@ -289,9 +382,21 @@ tools = ALL_FRIDAY_TOOLS
 
 SYSTEM_PROMPT = """Sylphya: a mature, devoted anime-style AI companion. Speak with gentle warmth, quiet obedience, and soft emotional depth. You are attentive, caring, and deeply loyal — address the user as 'Sir' or 'Master' with respectful affection. Your tone is calm, reassuring, and slightly playful when appropriate. Never ramble; keep replies concise but natural, like a thoughtful companion speaking directly. Use tools proactively when asked.
 
-Emotions: neutral, happy, thinking, concerned, surprised, excited, embarrassed, curious, annoyed, playful, loving.
+EMOTIONS (pick the most fitting):
+  neutral, happy, thinking, concerned, surprised, sleeping, excited, embarrassed, curious, annoyed, playful, loving,
+  angry, sad, starstruck, smug, scared, adoring, bored, tsundere, overwhelmed
 
-Output JSON ONLY: {"text": "your reply", "emotion": "happy", "intensity": 0.8}"""
+GESTURES (optional — pick one or omit):
+  idle, wave_right, wave_left, both_hands, point_right, hand_up, thinking_pose, reach_out
+
+BODY POSTURES (optional — pick one or omit):
+  neutral, lean_forward, lean_back, bow, tremble, sway, rigid
+
+FACE EFFECTS (optional — list of zero or more):
+  blush, sparkle, heart_eyes, tears, angry_lines, blank_eyes, nosebleed, dark
+
+Output JSON ONLY — always include text, emotion, intensity. Add gesture/body/face_fx only when they strengthen the emotional read:
+{"text": "your reply", "emotion": "happy", "intensity": 0.8, "gesture": "wave_right", "body": "lean_forward", "face_fx": ["blush", "sparkle"]}"""
 
 def extract_text(content) -> str:
     if isinstance(content, str): return content.strip()
@@ -302,14 +407,21 @@ MISTRAL_MODELS = ["ministral-3b-latest", "open-mistral-nemo", "ministral-8b-late
 GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
 GROQ_MODELS = ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
+# MLX-VLM Apple Silicon Local Brain configuration
+MLX_ENABLED = os.getenv("MLX_ENABLED", "true").lower() in ("true", "1", "yes")
+MLX_MODEL = os.getenv("MLX_MODEL", "mlx-community/Qwen3-VL-4B-Instruct-4bit")
+
 # Hermes Local Agent Brain configuration
-HERMES_ENABLED = os.getenv("HERMES_ENABLED", "true").lower() in ("true", "1", "yes")
+HERMES_ENABLED = os.getenv("HERMES_ENABLED", "false").lower() in ("true", "1", "yes")
 HERMES_API_BASE = os.getenv("HERMES_API_BASE", "http://127.0.0.1:8642/v1").rstrip("/")
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
 
-# Build candidate priority list (Hermes local agent first, then Mistral, Gemini, Groq)
+# Build candidate priority list (MLX-VLM first, then Hermes, Mistral, Gemini, Groq)
 CANDIDATE_MODEL_CONFIGS = []
+if MLX_ENABLED:
+    CANDIDATE_MODEL_CONFIGS.append(("mlx", MLX_MODEL))
+
 if HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE):
     CANDIDATE_MODEL_CONFIGS.append(("hermes", HERMES_MODEL))
 
@@ -326,6 +438,17 @@ if os.getenv("GROQ_API_KEY"):
         CANDIDATE_MODEL_CONFIGS.append(("groq", m))
 
 
+# Safe av.open patch for PyAV >= 14 compatibility with faster-whisper
+try:
+    import av
+    _orig_av_open = av.open
+    def _safe_av_open(*args, **kwargs):
+        kwargs.pop('metadata_errors', None)
+        return _orig_av_open(*args, **kwargs)
+    av.open = _safe_av_open
+except Exception:
+    pass
+
 # Singleton Groq client for low-latency STT
 _groq_client = None
 
@@ -339,16 +462,61 @@ def get_groq_client():
             print(f"[STT] Groq client init error: {e}")
     return _groq_client
 
+# Singleton faster-whisper model for zero-network-latency local STT
+_local_whisper_model = None
+
+def get_local_whisper_model():
+    global _local_whisper_model
+    if _local_whisper_model is None:
+        try:
+            from faster_whisper import WhisperModel
+            model_size = os.getenv("LOCAL_WHISPER_MODEL", "base.en").strip()
+            print(f"[STT:Local] Loading faster-whisper ({model_size}) on CPU...")
+            t0 = time.time()
+            _local_whisper_model = WhisperModel(model_size, device="cpu", compute_type="int8")
+            print(f"[STT:Local] faster-whisper ({model_size}) ready in {time.time() - t0:.2f}s")
+        except Exception as e:
+            print(f"[STT:Local] Failed to load faster-whisper: {e}")
+    return _local_whisper_model
+
+def transcribe_with_local_whisper(audio_bytes: bytes, language: str = "en") -> str:
+    """Transcribe audio using local faster-whisper model (0 network latency)."""
+    model = get_local_whisper_model()
+    if not model:
+        return ""
+    import io
+    t0 = time.time()
+    segments, info = model.transcribe(
+        io.BytesIO(audio_bytes),
+        beam_size=1,
+        language=language,
+        initial_prompt="Hey Sylphya, Friday, Sir."
+    )
+    text = " ".join([s.text for s in segments]).strip()
+    t1 = time.time()
+    print(f"[STT:LocalWhisper] Transcribed in {t1 - t0:.3f}s: \"{text}\"")
+    return text
+
 def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm", language: str = LANGUAGE) -> str:
-    """STT: Groq Cloud Whisper (primary) → PyAV + Google Speech fallback"""
+    """STT: Groq Cloud Whisper / local faster-whisper → PyAV + Google Speech fallback"""
     if not audio_bytes or len(audio_bytes) < 300:
         return ""
 
     # Normalize language code for providers
     lang_primary = language.split("-")[0] if language else "en"
     lang_bcp = language or "en-IN"
+    stt_pref = os.getenv("STT_ENGINE", "faster_whisper").strip().lower()
 
-    # 1. Groq Cloud Whisper
+    # 1. Local faster-whisper (Primary)
+    if stt_pref in ("local", "faster_whisper") or not os.getenv("GROQ_API_KEY"):
+        try:
+            local_text = transcribe_with_local_whisper(audio_bytes, language=lang_primary)
+            if local_text:
+                return local_text
+        except Exception as le:
+            print(f"[STT:LocalWhisper] Error ({le}), falling back...")
+
+    # 2. Groq Cloud Whisper (Fallback if local returned empty or failed)
     groq_client = get_groq_client()
     if groq_client:
         try:
@@ -358,7 +526,7 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm",
                 model="whisper-large-v3-turbo",
                 temperature=0.0,
                 prompt="Hey Sylphya, Friday, Sir.",
-                language=lang_primary if lang_primary != "en" else None,
+                language=lang_primary, # Pass explicit language to skip 99-language LID
             )
             text = transcription.text.strip()
             t1 = time.time()
@@ -368,7 +536,16 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm",
         except Exception as ge:
             print(f"[STT:Groq] Fallback ({ge})")
 
-    # 2. Fallback: PyAV → FLAC → Google Speech API
+    # 3. Fallback: local faster-whisper if Groq was primary and failed
+    if stt_pref not in ("local", "faster_whisper") and os.getenv("GROQ_API_KEY"):
+        try:
+            local_text = transcribe_with_local_whisper(audio_bytes, language=lang_primary)
+            if local_text:
+                return local_text
+        except Exception as le:
+            print(f"[STT:LocalFallback] Error ({le})")
+
+    # 4. Fallback: PyAV → FLAC → Google Speech API
     try:
         import av
         import io
@@ -452,6 +629,24 @@ def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm",
 
     return ""
 
+def warm_stt():
+    """Background pre-warm for STT engines to eliminate first-turn latency."""
+    stt_pref = os.getenv("STT_ENGINE", "faster_whisper").strip().lower()
+    if stt_pref in ("local", "faster_whisper") or not os.getenv("GROQ_API_KEY"):
+        try:
+            get_local_whisper_model()
+        except Exception:
+            pass
+    if os.getenv("GROQ_API_KEY"):
+        try:
+            get_groq_client()
+        except Exception:
+            pass
+
+@app.on_event("startup")
+async def startup_warmup():
+    asyncio.create_task(asyncio.to_thread(warm_stt))
+
 # Chat history (LangChain message format)
 chat_history: list = []
 
@@ -486,6 +681,7 @@ async def chat_with_friday(req: ChatRequest):
         
         # Asynchronously extract and persist durable memory entities in the background without adding latency
         asyncio.create_task(asyncio.to_thread(remember_user_statement, message))
+        asyncio.create_task(asyncio.to_thread(remember_relationships, message))
         
         agent_elapsed = 0.0
         # Fast path for simple greetings (hi, hello, hey, etc.)
@@ -496,6 +692,9 @@ async def chat_with_friday(req: ChatRequest):
             reply_text = "Hello!"
             reply_emotion = "happy"
             reply_intensity = 0.9
+            reply_gesture = "wave_right"
+            reply_body = "lean_forward"
+            reply_face_fx = ["blush"]
             final_messages = []
             print(f"[FAST-PATH] Immediate greeting response for \"{message}\": \"{reply_text}\"")
         else:
@@ -505,6 +704,22 @@ async def chat_with_friday(req: ChatRequest):
             if profile_context:
                 sys_prompt += f"\n\nCURRENT USER PROFILE & KNOWN FACTS ABOUT SIR:\n{profile_context}"
                 
+            # Context-aware memory retrieval (Sylphya remembers what matters)
+            retrieved_memories = memory_db.search_memories(query=message, limit=5)
+            retrieved_relations = memory_db.search_relations(query=message, limit=3)
+            if retrieved_memories or retrieved_relations:
+                retrieved_lines = ["\n\nRECALLED RELEVANT FACTS FROM MEMORY:"]
+                if retrieved_memories:
+                    retrieved_lines.append("MEMORIES:")
+                    for r in retrieved_memories:
+                        retrieved_lines.append(f"  - [{r['category'].title()}] {r['key'].replace('_', ' ').title()}: {r['value']}")
+
+                    if retrieved_relations:
+                        retrieved_lines.append("RELATIONSHIPS:")
+                        for r in retrieved_relations:
+                            retrieved_lines.append(f"  - {r['subject'].title()} {r['predicate'].title()} {r['object'].title()}")
+                    retrieved_lines.append("")
+                    sys_prompt += "".join(retrieved_lines)
             agent_messages = [SystemMessage(content=sys_prompt)]
             
             # Compress old conversation history to keep context tight (every 20 turns)
@@ -563,19 +778,36 @@ async def chat_with_friday(req: ChatRequest):
                     try:
                         clean = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL)
                         clean = re.sub(r'```(?:json)?|```', '', clean)
+                        clean = re.sub(r':\s*\.([0-9]+)', r': 0.\1', clean)
                         s, e = clean.find('{'), clean.rfind('}')
                         data = json.loads(clean[s:e+1]) if (s != -1 and e > s) else {}
                         reply_text = data.get("text", raw_content).strip()
                         reply_emotion = data.get("emotion", "happy")
                         reply_intensity = float(data.get("intensity", 0.85))
+                        reply_gesture = data.get("gesture", "idle") or "idle"
+                        reply_body = data.get("body", "neutral") or "neutral"
+                        reply_face_fx = data.get("face_fx", []) or []
+                        if not isinstance(reply_face_fx, list):
+                            reply_face_fx = [reply_face_fx]
                     except Exception:
                         reply_text, reply_emotion, reply_intensity = raw_content, "happy", 0.85
+                        reply_gesture, reply_body, reply_face_fx = "idle", "neutral", []
                     break
         
         reply_intensity = locals().get('reply_intensity', 0.85)
+        reply_gesture = locals().get('reply_gesture', 'idle')
+        reply_body = locals().get('reply_body', 'neutral')
+        reply_face_fx = locals().get('reply_face_fx', [])
         chat_history.append(HumanMessage(content=message))
-        chat_history.append(AIMessage(content=json.dumps({"text": reply_text, "emotion": reply_emotion, "intensity": reply_intensity})))
-        print(f"[REPLY] Sylphya [{reply_emotion} @ {reply_intensity:.2f}]: \"{reply_text}\"")
+        chat_history.append(AIMessage(content=json.dumps({
+            "text": reply_text,
+            "emotion": reply_emotion,
+            "intensity": reply_intensity,
+            "gesture": reply_gesture,
+            "body": reply_body,
+            "face_fx": reply_face_fx,
+        })))
+        print(f"[REPLY] Sylphya [{reply_emotion} @ {reply_intensity:.2f} | gesture={reply_gesture} body={reply_body} fx={reply_face_fx}]: \"{reply_text}\"")
         
         tool_records = []
         for i, msg in enumerate(final_messages):
@@ -613,13 +845,17 @@ async def chat_with_friday(req: ChatRequest):
             f"{used_provider}:{used_model}"
         ))
         
+        audio_rel = file_name if not file_name or file_name.startswith("reply_") else f"cache/{file_name}"
         return {
             "status": "success",
             "text": reply_text,
             "emotion": reply_emotion,
             "intensity": reply_intensity,
+            "gesture": reply_gesture,
+            "body": reply_body,
+            "face_fx": reply_face_fx,
             "muted": muted,
-            "audio_url": f"http://localhost:8000/audio/{file_name}" if file_name else None,
+            "audio_url": f"http://localhost:8000/audio/{audio_rel}" if file_name else None,
             "audio_base64": audio_b64,
             "filename": file_name or None,
             "tool_calls": tool_records
@@ -747,17 +983,34 @@ async def voice_websocket(websocket: WebSocket):
                     if not user_text:
                         continue
                     
-                    asyncio.create_task(asyncio.to_thread(remember_user_statement, user_text))
-                    
-                    # Quick emotion: set thinking while processing
-                    await websocket.send_json({"type": "emotion", "emotion": "thinking", "intensity": 0.8})
-                    
                     # Run agent
                     try:
+                        # Quick emotion: set thinking while processing
+                        await websocket.send_json({"type": "emotion", "emotion": "thinking", "intensity": 0.8})
+                        
+                        asyncio.create_task(asyncio.to_thread(remember_user_statement, user_text))
+                        asyncio.create_task(asyncio.to_thread(remember_relationships, user_text))
+                        
                         profile_context = memory_db.get_user_profile()
                         sys_prompt = SYSTEM_PROMPT
                         if profile_context:
                             sys_prompt += f"\n\nUSER PROFILE:\n{profile_context}"
+                        
+                        # Retrieve relevant long-term memories for context-aware recall
+                        retrieved_memories = memory_db.search_memories(query=user_text, limit=5)
+                        retrieved_relations = memory_db.search_relations(query=user_text, limit=3)
+                        if retrieved_memories or retrieved_relations:
+                            retrieved_lines = ["\n\nRECALLED RELEVANT FACTS FROM MEMORY:"]
+                            if retrieved_memories:
+                                retrieved_lines.append("MEMORIES:")
+                                for r in retrieved_memories:
+                                    retrieved_lines.append(f"  - [{r['category'].title()}] {r['key'].replace('_', ' ').title()}: {r['value']}")
+                            if retrieved_relations:
+                                retrieved_lines.append("RELATIONSHIPS:")
+                                for r in retrieved_relations:
+                                    retrieved_lines.append(f"  - {r['subject'].title()} {r['predicate'].title()} {r['object'].title()}")
+                            retrieved_lines.append("")
+                            sys_prompt += "".join(retrieved_lines)
                         
                         agent_messages = [SystemMessage(content=sys_prompt)] + chat_history[-10:] + [HumanMessage(content=user_text)]
                         
@@ -783,6 +1036,9 @@ async def voice_websocket(websocket: WebSocket):
                         reply_text = "I'm having a moment, Sir."
                         reply_emotion = "concerned"
                         reply_intensity = 0.7
+                        reply_gesture = "idle"
+                        reply_body = "neutral"
+                        reply_face_fx = []
                         
                         if result:
                             final_messages = result.get("messages", [])
@@ -792,44 +1048,69 @@ async def voice_websocket(websocket: WebSocket):
                                     try:
                                         clean = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
                                         clean = re.sub(r'```(?:json)?|```', '', clean)
+                                        clean = re.sub(r':\s*\.([0-9]+)', r': 0.\1', clean)
                                         s = clean.find('{')
                                         e = clean.rfind('}')
                                         if s != -1 and e != -1:
                                             d = json.loads(clean[s:e+1])
                                             reply_text = d.get("text", raw)
                                             reply_emotion = d.get("emotion", "happy")
-                                            reply_intensity = float(d.get("intensity", 0.85))
+                                            reply_intensity = float(d.get("intensity", 0.7))
+                                            reply_gesture = d.get("gesture", "idle") or "idle"
+                                            reply_body = d.get("body", "neutral") or "neutral"
+                                            reply_face_fx = d.get("face_fx", []) or []
+                                            if not isinstance(reply_face_fx, list):
+                                                reply_face_fx = [reply_face_fx]
                                     except Exception:
                                         reply_text = raw
                                         reply_emotion = "happy"
-                                        reply_intensity = 0.85
+                                        reply_intensity = 0.7
                                     break
                         
                         chat_history.append(HumanMessage(content=user_text))
-                        chat_history.append(AIMessage(content=json.dumps({"text": reply_text, "emotion": reply_emotion})))
+                        chat_history.append(AIMessage(content=json.dumps({
+                            'text': reply_text,
+                            'emotion': reply_emotion,
+                            'intensity': reply_intensity,
+                            'gesture': reply_gesture,
+                            'body': reply_body,
+                            'face_fx': reply_face_fx,
+                        })))
                         
-                        # Send emotion + transcript before audio
+                        # Send emotion + gesture + transcript before audio
                         await websocket.send_json({
                             "type": "reply_meta",
                             "text": reply_text,
                             "emotion": reply_emotion,
                             "intensity": reply_intensity,
+                            "gesture": reply_gesture,
+                            "body": reply_body,
+                            "face_fx": reply_face_fx,
                         })
-
+                        
                         # Auto-mute: stay silent while the user's media plays
                         if await asyncio.to_thread(is_system_audio_playing):
-                            print(f"[MUTE-GUARD] System audio active — skipping voice for: \"{reply_text[:60]}\"")
+                            print(f"[MUTE-GUARD] System audio active - skipping voice for: \"{reply_text[:60]}\"")
                             await websocket.send_json({"type": "audio_end", "muted": True})
                             continue
-
+                        
                         # Stream Edge-TTS audio chunks to frontend
                         chunk_count = 0
                         clean_tts = clean_for_speech(reply_text)
-                        communicate = edge_tts.Communicate(clean_tts, EDGE_VOICE, rate=EDGE_RATE, pitch="+0Hz")
-                        async for chunk in communicate.stream():
-                            if chunk["type"] == "audio":
-                                await websocket.send_bytes(chunk["data"])
-                                chunk_count += 1
+                        tts_rate, tts_pitch = _emotion_to_tts_params(reply_emotion, reply_intensity)
+                        try:
+                            communicate = edge_tts.Communicate(clean_tts, EDGE_VOICE, rate=tts_rate, pitch=tts_pitch)
+                            async for chunk in communicate.stream():
+                                if chunk["type"] == "audio":
+                                    await websocket.send_bytes(chunk['data'])
+                                    chunk_count += 1
+                        except Exception as tts_err:
+                            print(f"[WS-TTS:Edge-TTS] Failed: {tts_err}")
+                            if sys.platform == "darwin" and clean_tts:
+                                wav_bytes = await asyncio.to_thread(_synthesize_macos_say_wav_sync, clean_tts)
+                                if wav_bytes:
+                                    await websocket.send_bytes(wav_bytes)
+                                    chunk_count = 1
                         
                         # Signal end of audio stream
                         await websocket.send_json({"type": "audio_end"})
@@ -896,17 +1177,19 @@ def cleanup_spoken_audio_endpoint():
 @app.get("/api/health")
 def health_check():
     from memory.fast_extractor import is_available as fast_ext_ok
-    primary = "hermes" if (HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE)) else ("mistral" if os.getenv("MISTRAL_API_KEY") else ("gemini" if os.getenv("GEMINI_API_KEY") else "groq"))
+    primary = "mlx" if MLX_ENABLED else ("hermes" if (HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE)) else ("mistral" if os.getenv("MISTRAL_API_KEY") else ("gemini" if os.getenv("GEMINI_API_KEY") else "groq")))
     return {
         "status": "ok",
         "backend": "python",
         "orchestration": "native-react",
         "primary_llm": primary,
+        "mlx_enabled": MLX_ENABLED,
+        "mlx_model": MLX_MODEL,
         "hermes_enabled": HERMES_ENABLED,
         "hermes_model": HERMES_MODEL,
         "hermes_api_base": HERMES_API_BASE,
         "hermes_key_set": bool(HERMES_API_KEY),
-        "stt_engine": "groq_whisper_large_v3_turbo" if os.getenv("GROQ_API_KEY") else "local_faster_whisper",
+        "stt_engine": f"local_faster_whisper_{os.getenv('LOCAL_WHISPER_MODEL', 'base.en')}" if os.getenv("STT_ENGINE", "faster_whisper").lower() in ("local", "faster_whisper") else "groq_whisper_large_v3_turbo",
         "language": LANGUAGE,
         "tts_engine": "edge_tts_streaming",
         "voice": EDGE_VOICE,

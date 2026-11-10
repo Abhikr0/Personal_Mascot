@@ -18,7 +18,7 @@ _ALWAYS_ON_TOOLS: Set[str] = {
     "get_current_time",
     "get_weather",
     "get_system_status",
-    "remember_fact",
+    "remember_information",
 }
 
 # Keyword → extra tool names to inject when the keyword appears in the user message
@@ -44,9 +44,26 @@ _KEYWORD_TOOL_MAP: Dict[str, Set[str]] = {
     # Volume
     "volume": {"set_volume", "get_volume"},
     "mute":   {"set_volume"},
-    # Screenshot
+    # Screenshot & Vision
     "screenshot": {"take_screenshot"},
     "screen": {"take_screenshot", "get_frontmost_app"},
+    "look": {"take_screenshot", "get_frontmost_app"},
+    "see": {"take_screenshot"},
+    "view": {"take_screenshot"},
+    "image": {"take_screenshot"},
+    "picture": {"take_screenshot"},
+    "desktop": {"take_screenshot", "get_frontmost_app"},
+    "capture": {"take_screenshot"},
+    # GUI & Screen control
+    "mouse": {"get_mouse_position", "mouse_move", "mouse_click"},
+    "click": {"mouse_click", "get_mouse_position"},
+    "cursor": {"get_mouse_position", "mouse_move"},
+    "move": {"mouse_move"},
+    "type": {"keyboard_type", "keyboard_hotkey"},
+    "keyboard": {"keyboard_type", "keyboard_hotkey"},
+    "press": {"keyboard_hotkey"},
+    "hotkey": {"keyboard_hotkey"},
+    "scroll": {"scroll_screen"},
     # Clipboard
     "clipboard": {"get_clipboard_text", "set_clipboard_text"},
     "copy": {"get_clipboard_text"},
@@ -580,6 +597,168 @@ def _run_hermes(
     return result_messages
 
 
+# Singleton MLX-VLM model and processor cache
+_mlx_model = None
+_mlx_processor = None
+_mlx_lock = None
+
+def get_mlx_vlm_model(model_name: str = "mlx-community/Qwen3-VL-4B-Instruct-4bit"):
+    global _mlx_model, _mlx_processor, _mlx_lock
+    if _mlx_lock is None:
+        import threading
+        _mlx_lock = threading.Lock()
+    with _mlx_lock:
+        if _mlx_model is None:
+            import time
+            import mlx_vlm
+            resolved_model = model_name or os.getenv("MLX_MODEL", "mlx-community/Qwen3-VL-4B-Instruct-4bit")
+            print(f"[MLX] Loading {resolved_model} into Apple Silicon unified memory...")
+            t0 = time.time()
+            _mlx_model, _mlx_processor = mlx_vlm.load(resolved_model)
+            print(f"[MLX] {resolved_model} loaded in {time.time() - t0:.2f}s")
+    return _mlx_model, _mlx_processor
+
+
+def _run_mlx(
+    messages: List[ChatMessage],
+    model_name: str,
+    tools: List[Any],
+) -> List[ChatMessage]:
+    """Runs an agent turn directly against the local MLX-VLM model on Apple Silicon GPU."""
+    import mlx_vlm
+
+    model, processor = get_mlx_vlm_model(model_name)
+
+    # Prune tools based on the last user message
+    last_user_msg = next((m.content for m in reversed(messages) if m.role == "user"), "")
+    effective_tools = _prune_tools(tools, last_user_msg) if tools else []
+    tool_map = {t.name: t for t in tools} if tools else {}
+
+    # Check for image references in message content
+    image_path = None
+    for m in reversed(messages):
+        if isinstance(m.content, str):
+            matches = re.findall(r"(?:/[\w\.\-]+)+\.(?:jpg|jpeg|png|webp)", m.content)
+            for match in matches:
+                if os.path.exists(match):
+                    image_path = match
+                    break
+        if image_path:
+            break
+
+    # Build prompt messages
+    formatted_messages = []
+    for m in messages:
+        if m.role == "system":
+            sys_content = m.content
+            if effective_tools:
+                tools_desc = "\n".join([f"- {t.name}: {t.description}" for t in effective_tools])
+                sys_content += f"\n\nAVAILABLE TOOLS:\n{tools_desc}\nIf you need to use a tool, you may reply with: {{\"tool\": \"tool_name\", \"args\": {{...}}}}. Otherwise reply directly in the required JSON format: {{\"text\": \"your reply\", \"emotion\": \"happy\", \"intensity\": 0.8}}"
+            formatted_messages.append({"role": "system", "content": sys_content})
+        elif m.role == "user":
+            if image_path and m == messages[-1]:
+                formatted_messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image_path},
+                        {"type": "text", "text": m.content}
+                    ]
+                })
+            else:
+                formatted_messages.append({"role": "user", "content": m.content})
+        elif m.role == "assistant":
+            formatted_messages.append({"role": "assistant", "content": m.content})
+        elif m.role == "tool":
+            formatted_messages.append({"role": "user", "content": f"[Tool Result from {m.name}]: {m.content}"})
+
+    prompt = mlx_vlm.apply_chat_template(processor, model.config, formatted_messages, add_generation_prompt=True)
+
+    result = mlx_vlm.generate(
+        model,
+        processor,
+        prompt=prompt,
+        image=image_path,
+        max_tokens=350,
+        temperature=0.7,
+        verbose=False
+    )
+    raw_output = result.text.strip()
+    print(f"[MLX] Generated {result.generation_tokens} tokens ({result.generation_tps:.1f} tps)")
+
+    result_messages: List[ChatMessage] = []
+
+    # Check for tool call
+    tool_executed = False
+    try:
+        clean = re.sub(r'<think>.*?</think>', '', raw_output, flags=re.DOTALL)
+        clean = re.sub(r'```(?:json)?|```', '', clean).strip()
+        clean = re.sub(r':\s*\.([0-9]+)', r': 0.\1', clean)
+        s = clean.find('{')
+        e = clean.rfind('}')
+        if s != -1 and e != -1:
+            parsed = json.loads(clean[s:e+1])
+            tool_name = parsed.get("tool") or parsed.get("action") or parsed.get("function")
+            if tool_name and tool_name in tool_map:
+                t_args = parsed.get("args") or parsed.get("arguments") or parsed.get("parameters") or {}
+                if isinstance(t_args, str):
+                    try:
+                        t_args = json.loads(t_args)
+                    except Exception:
+                        t_args = {}
+
+                tc_data = [{"id": "mlx_tc_1", "name": tool_name, "args": t_args}]
+                result_messages.append(AIMessage(content=raw_output, tool_calls=tc_data))
+
+                tool_fn = tool_map[tool_name]
+                try:
+                    res = tool_fn.invoke(t_args)
+                except Exception as err:
+                    res = f"Tool execution error: {err}"
+
+                res_str = str(res)
+                result_messages.append(ChatMessage(role="tool", content=res_str, tool_call_id="mlx_tc_1", name=tool_name))
+                formatted_messages.append({"role": "assistant", "content": raw_output})
+
+                # Check if tool produced a screenshot or image (e.g. take_screenshot)
+                follow_up_image = None
+                img_match = re.search(r"(/[^\s]+\.(?:png|jpg|jpeg|webp))", res_str)
+                if img_match and os.path.exists(img_match.group(1)):
+                    follow_up_image = img_match.group(1)
+
+                if follow_up_image:
+                    formatted_messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": follow_up_image},
+                            {"type": "text", "text": f"Screenshot captured: {res_str}. Look at what is on the screen and describe it or answer the user request. Output JSON ONLY: {{\"text\": \"your reply\", \"emotion\": \"happy\", \"intensity\": 0.8}}"}
+                        ]
+                    })
+                else:
+                    formatted_messages.append({
+                        "role": "user",
+                        "content": f"[Tool Result from {tool_name}]: {res_str}\nNow respond to the user based on this result. Output JSON ONLY: {{\"text\": \"your reply\", \"emotion\": \"happy\", \"intensity\": 0.8}}"
+                    })
+
+                follow_up_prompt = mlx_vlm.apply_chat_template(processor, model.config, formatted_messages, add_generation_prompt=True)
+                follow_up_res = mlx_vlm.generate(
+                    model,
+                    processor,
+                    prompt=follow_up_prompt,
+                    image=follow_up_image,
+                    max_tokens=300,
+                    temperature=0.7
+                )
+                result_messages.append(AIMessage(content=follow_up_res.text.strip()))
+                tool_executed = True
+    except Exception as te:
+        print(f"[MLX] Tool parse/exec error: {te}")
+
+    if not tool_executed:
+        result_messages.append(AIMessage(content=raw_output))
+
+    return result_messages
+
+
 def execute_agent_turn(
     messages: List[Any],
     provider: str,
@@ -592,7 +771,10 @@ def execute_agent_turn(
     """
     norm_messages = normalize_messages(messages)
 
-    if provider == "hermes":
+    if provider == "mlx":
+        out_messages = _run_mlx(norm_messages, model_name, tools)
+
+    elif provider == "hermes":
         api_key = os.getenv("HERMES_API_KEY", "")
         api_base = os.getenv("HERMES_API_BASE", "http://127.0.0.1:8642/v1")
         out_messages = _run_hermes(norm_messages, model_name, tools, api_key, api_base)
