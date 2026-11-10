@@ -16,7 +16,6 @@ load_dotenv(override=True)
 _ALWAYS_ON_TOOLS: Set[str] = {
     "web_search",
     "get_current_time",
-    "get_weather",
     "get_system_status",
     "remember_information",
 }
@@ -24,36 +23,56 @@ _ALWAYS_ON_TOOLS: Set[str] = {
 # Keyword → extra tool names to inject when the keyword appears in the user message
 _KEYWORD_TOOL_MAP: Dict[str, Set[str]] = {
     # File operations
-    "file": {"read_file", "list_files"},
+    "file": {"read_file", "list_files", "open_file", "search_files"},
+    "files": {"list_files", "search_files"},
     "read":  {"read_file"},
-    "write": {"create_or_write_file"},
-    "folder": {"list_files", "create_folder"},
+    "write": {"open_notes_and_write", "create_or_write_file"},
+    "folder": {"list_files", "create_folder", "open_file"},
     "directory": {"list_files", "create_folder"},
+    "find": {"search_files", "web_search"},
     # App / window control
-    "open":   {"open_app", "open_website"},
-    "launch": {"open_app"},
+    "open":   {"open_app", "open_application", "open_website", "open_file", "open_settings"},
+    "launch": {"open_app", "open_application"},
     "close":  {"close_app"},
+    "quit":   {"close_app"},
     "app":    {"open_app", "close_app", "list_running_apps"},
-    "window": {"get_frontmost_app", "list_running_apps"},
+    "apps":   {"list_running_apps", "open_app"},
+    "running": {"list_running_apps"},
+    "window": {"get_frontmost_app", "get_active_window", "list_running_apps", "manage_window"},
+    "windows": {"get_frontmost_app", "get_active_window", "list_running_apps"},
+    "active": {"get_frontmost_app", "get_active_window"},
+    "minimize": {"manage_window"},
+    "maximize": {"manage_window"},
+    "switch": {"manage_window"},
     # Music / media
-    "music": {"play_music", "control_music", "get_volume"},
-    "play":  {"play_music", "open_app"},
-    "pause": {"control_music"},
+    "music": {"play_music", "control_music", "get_volume", "control_media_volume"},
+    "play":  {"play_music", "control_music", "control_media_volume", "open_app"},
+    "pause": {"control_music", "control_media_volume"},
+    "next":  {"control_music", "control_media_volume"},
+    "previous": {"control_music", "control_media_volume"},
     "song":  {"play_music"},
-    "spotify": {"play_music", "control_music"},
-    # Volume
-    "volume": {"set_volume", "get_volume"},
-    "mute":   {"set_volume"},
-    # Screenshot & Vision
-    "screenshot": {"take_screenshot"},
-    "screen": {"take_screenshot", "get_frontmost_app"},
-    "look": {"take_screenshot", "get_frontmost_app"},
-    "see": {"take_screenshot"},
-    "view": {"take_screenshot"},
+    "playing": {"play_music", "get_frontmost_app"},
+    "spotify": {"play_music", "control_music", "open_app"},
+    # Volume & settings
+    "volume": {"set_volume", "get_volume", "control_media_volume"},
+    "mute":   {"set_volume", "control_media_volume"},
+    "sound":  {"set_volume", "get_volume", "control_media_volume", "open_settings"},
+    "settings": {"open_settings"},
+    "wifi": {"open_settings"},
+    "bluetooth": {"open_settings"},
+    # Screenshot & Screen Context
+    "screenshot": {"take_screenshot", "get_frontmost_app", "get_active_window"},
+    "screen": {"take_screenshot", "get_frontmost_app", "get_active_window"},
+    "display": {"take_screenshot", "get_frontmost_app", "open_settings"},
+    "doing": {"take_screenshot", "get_frontmost_app", "get_active_window"},
+    "watching": {"take_screenshot", "get_frontmost_app", "get_active_window"},
+    "look": {"take_screenshot", "get_frontmost_app", "get_active_window"},
+    "see": {"take_screenshot", "get_frontmost_app", "get_active_window"},
+    "view": {"take_screenshot", "get_frontmost_app"},
     "image": {"take_screenshot"},
     "picture": {"take_screenshot"},
-    "desktop": {"take_screenshot", "get_frontmost_app"},
-    "capture": {"take_screenshot"},
+    "desktop": {"take_screenshot", "get_frontmost_app", "manage_window"},
+    "capture": {"take_screenshot", "get_frontmost_app", "get_active_window"},
     # GUI & Screen control
     "mouse": {"get_mouse_position", "mouse_move", "mouse_click"},
     "click": {"mouse_click", "get_mouse_position"},
@@ -66,29 +85,32 @@ _KEYWORD_TOOL_MAP: Dict[str, Set[str]] = {
     "scroll": {"scroll_screen"},
     # Clipboard
     "clipboard": {"get_clipboard_text", "set_clipboard_text"},
-    "copy": {"get_clipboard_text"},
+    "copy": {"get_clipboard_text", "set_clipboard_text"},
     "paste": {"set_clipboard_text"},
     # Notes
-    "note": {"open_notes_and_write", "read_notes"},
-    "notes": {"open_notes_and_write", "read_notes"},
-    "write": {"open_notes_and_write", "create_or_write_file"},
+    "note": {"open_notes_and_write", "read_notes", "write_note"},
+    "notes": {"open_notes_and_write", "read_notes", "write_note"},
     # Shortcuts / automation
     "shortcut": {"run_shortcut"},
     "automate": {"run_shortcut"},
     # Memory
     "remember": {"remember_information", "recall_memory"},
+    "recall": {"recall_memory", "list_memories"},
     "forget": {"forget_memory"},
     "memory": {"recall_memory", "list_memories"},
+    "memories": {"list_memories", "recall_memory"},
     # Search / web
-    "search": {"web_search"},
-    "web": {"web_search", "open_url"},
+    "search": {"web_search", "search_files"},
+    "web": {"web_search", "open_url", "open_website"},
+    "website": {"open_website", "open_url"},
     # System
     "lock": {"lock_screen"},
     "sleep": {"sleep_mac"},
-    "battery": {"get_battery"},
+    "battery": {"get_battery", "get_system_status"},
+    "power": {"get_battery", "get_system_status"},
     "trash": {"empty_trash"},
-    "notification": {"send_notification"},
-    "notify": {"send_notification"},
+    "notification": {"send_notification", "send_desktop_notification"},
+    "notify": {"send_notification", "send_desktop_notification"},
 }
 
 
@@ -369,6 +391,13 @@ def _run_gemini(
                     name=t_name,
                     response={"result": res_str}
                 ))
+                img_match = re.search(r"(/[^\s]+\.(?:png|jpg|jpeg|webp))", res_str)
+                if img_match and os.path.exists(img_match.group(1)):
+                    try:
+                        with open(img_match.group(1), "rb") as img_f:
+                            fn_response_parts.append(types.Part.from_bytes(data=img_f.read(), mime_type="image/png"))
+                    except Exception:
+                        pass
 
             contents.append(types.Content(role="user", parts=fn_response_parts))
         else:
@@ -385,7 +414,7 @@ def _run_groq(
     tools: List[Any],
     api_key: str
 ) -> List[ChatMessage]:
-    from groq import Groq
+    from groq import Groq, BadRequestError
 
     client = Groq(api_key=api_key)
     tool_map = {t.name: t for t in tools}  # full map for execution
@@ -394,17 +423,47 @@ def _run_groq(
     effective_tools = _prune_tools(tools, last_user_msg)
     tool_schemas = [t.openai_tool for t in effective_tools] if effective_tools else None
 
+    resolved_model = model_name or "openai/gpt-oss-120b"
     history = [m.to_dict() for m in messages]
     result_messages: List[ChatMessage] = []
 
     for _ in range(5):
-        resp = client.chat.completions.create(
-            model=model_name or "qwen/qwen3.8-27b",
-            messages=history,
-            tools=tool_schemas,
-            temperature=0.7,
-            max_tokens=1024
-        )
+        req_kwargs: Dict[str, Any] = {
+            "model": resolved_model,
+            "messages": history,
+            "tools": tool_schemas,
+            "temperature": 0.7,
+            "max_tokens": 1024,
+        }
+        if "gpt-oss" in resolved_model:
+            req_kwargs["reasoning_effort"] = "low"
+
+        try:
+            resp = client.chat.completions.create(**req_kwargs)
+        except BadRequestError as bre:
+            err_info = (getattr(bre, "body", None) or {}).get("error", {})
+            if err_info.get("code") == "tool_use_failed":
+                failed_gen = err_info.get("failed_generation", "")
+                recovered = None
+                try:
+                    parsed = json.loads(failed_gen)
+                    if isinstance(parsed, dict) and str(parsed.get("name", "")).lower() in ("json", "final_response", "reply", "response"):
+                        args = parsed.get("arguments")
+                        if isinstance(args, str):
+                            args = json.loads(args)
+                        if isinstance(args, dict):
+                            recovered = json.dumps(args)
+                except Exception:
+                    recovered = None
+                if recovered:
+                    result_messages.append(AIMessage(content=recovered))
+                    break
+                # Malformed pseudo-tool call: retry once without tools
+                req_kwargs.pop("tools", None)
+                resp = client.chat.completions.create(**req_kwargs)
+            else:
+                raise
+
         choice = resp.choices[0]
         msg = choice.message
         tool_calls = getattr(msg, "tool_calls", None)
@@ -504,257 +563,97 @@ def _run_hermes(
     result_messages: List[ChatMessage] = []
 
     resolved_model = model_name or os.getenv("HERMES_MODEL", "hermes-agent")
-    payload: Dict[str, Any] = {
-        "model": resolved_model,
-        "messages": history,
-        "temperature": 0.7,
-        "stream": False
-    }
+    for _ in range(5):
+        payload: Dict[str, Any] = {
+            "model": resolved_model,
+            "messages": history,
+            "temperature": 0.7,
+            "stream": False
+        }
 
-    # If calling a model other than hermes-agent, provide client-side tool schemas
-    if tool_schemas and resolved_model != "hermes-agent":
-        payload["tools"] = tool_schemas
+        # If calling a model other than hermes-agent, provide client-side tool schemas
+        if tool_schemas and resolved_model != "hermes-agent":
+            payload["tools"] = tool_schemas
 
-    if has_httpx:
-        with httpx.Client(timeout=8.0) as client:
-            resp = client.post(url, headers=headers, json=payload)
+        if has_httpx:
+            with httpx.Client(timeout=httpx.Timeout(8.0, connect=1.0)) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+        else:
+            resp = requests.post(url, headers=headers, json=payload, timeout=(1.0, 8.0))
             resp.raise_for_status()
             data = resp.json()
-    else:
-        resp = requests.post(url, headers=headers, json=payload, timeout=8.0)
-        resp.raise_for_status()
-        data = resp.json()
 
-    choice = data.get("choices", [{}])[0]
-    msg = choice.get("message", {})
-    content = msg.get("content", "") or ""
-    tool_calls = msg.get("tool_calls")
+        choice = data.get("choices", [{}])[0]
+        msg = choice.get("message", {})
+        content = msg.get("content", "") or ""
+        tool_calls = msg.get("tool_calls")
 
-    if tool_calls:
-        tc_data = []
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            args = fn.get("arguments", {})
-            if isinstance(args, str):
+        if tool_calls:
+            tc_data = []
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                tc_data.append({
+                    "id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "args": args
+                })
+            ai_msg = AIMessage(content=content, tool_calls=tc_data)
+            result_messages.append(ai_msg)
+
+            history.append({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "id": tc.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("function", {}).get("name"),
+                            "arguments": tc.get("function", {}).get("arguments") if isinstance(tc.get("function", {}).get("arguments"), str) else json.dumps(tc.get("function", {}).get("arguments", {}))
+                        }
+                    }
+                    for tc in tool_calls
+                ]
+            })
+
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                t_name = fn.get("name", "")
+                args_str = fn.get("arguments", "{}")
                 try:
-                    args = json.loads(args)
+                    args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
                 except Exception:
                     args = {}
-            tc_data.append({
-                "id": tc.get("id", ""),
-                "name": fn.get("name", ""),
-                "args": args
-            })
-        ai_msg = AIMessage(content=content, tool_calls=tc_data)
-        result_messages.append(ai_msg)
 
-        history.append({
-            "role": "assistant",
-            "content": content,
-            "tool_calls": [
-                {
-                    "id": tc.get("id"),
-                    "type": "function",
-                    "function": {
-                        "name": tc.get("function", {}).get("name"),
-                        "arguments": tc.get("function", {}).get("arguments") if isinstance(tc.get("function", {}).get("arguments"), str) else json.dumps(tc.get("function", {}).get("arguments", {}))
-                    }
-                }
-                for tc in tool_calls
-            ]
-        })
-
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            t_name = fn.get("name", "")
-            args_str = fn.get("arguments", "{}")
-            try:
-                args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
-            except Exception:
-                args = {}
-
-            tool_fn = tool_map.get(t_name)
-            if tool_fn:
-                try:
-                    res = tool_fn.invoke(args)
-                except Exception as err:
-                    res = f"Tool execution error: {err}"
-            else:
-                res = f"Tool {t_name} not found"
-
-            res_str = str(res)
-            history.append({
-                "role": "tool",
-                "tool_call_id": tc.get("id"),
-                "name": t_name,
-                "content": res_str
-            })
-            result_messages.append(ChatMessage(role="tool", content=res_str, tool_call_id=tc.get("id"), name=t_name))
-    else:
-        final_ai = AIMessage(content=content)
-        result_messages.append(final_ai)
-
-    return result_messages
-
-
-# Singleton MLX-VLM model and processor cache
-_mlx_model = None
-_mlx_processor = None
-_mlx_lock = None
-
-def get_mlx_vlm_model(model_name: str = "mlx-community/Qwen3-VL-4B-Instruct-4bit"):
-    global _mlx_model, _mlx_processor, _mlx_lock
-    if _mlx_lock is None:
-        import threading
-        _mlx_lock = threading.Lock()
-    with _mlx_lock:
-        if _mlx_model is None:
-            import time
-            import mlx_vlm
-            resolved_model = model_name or os.getenv("MLX_MODEL", "mlx-community/Qwen3-VL-4B-Instruct-4bit")
-            print(f"[MLX] Loading {resolved_model} into Apple Silicon unified memory...")
-            t0 = time.time()
-            _mlx_model, _mlx_processor = mlx_vlm.load(resolved_model)
-            print(f"[MLX] {resolved_model} loaded in {time.time() - t0:.2f}s")
-    return _mlx_model, _mlx_processor
-
-
-def _run_mlx(
-    messages: List[ChatMessage],
-    model_name: str,
-    tools: List[Any],
-) -> List[ChatMessage]:
-    """Runs an agent turn directly against the local MLX-VLM model on Apple Silicon GPU."""
-    import mlx_vlm
-
-    model, processor = get_mlx_vlm_model(model_name)
-
-    # Prune tools based on the last user message
-    last_user_msg = next((m.content for m in reversed(messages) if m.role == "user"), "")
-    effective_tools = _prune_tools(tools, last_user_msg) if tools else []
-    tool_map = {t.name: t for t in tools} if tools else {}
-
-    # Check for image references in message content
-    image_path = None
-    for m in reversed(messages):
-        if isinstance(m.content, str):
-            matches = re.findall(r"(?:/[\w\.\-]+)+\.(?:jpg|jpeg|png|webp)", m.content)
-            for match in matches:
-                if os.path.exists(match):
-                    image_path = match
-                    break
-        if image_path:
-            break
-
-    # Build prompt messages
-    formatted_messages = []
-    for m in messages:
-        if m.role == "system":
-            sys_content = m.content
-            if effective_tools:
-                tools_desc = "\n".join([f"- {t.name}: {t.description}" for t in effective_tools])
-                sys_content += f"\n\nAVAILABLE TOOLS:\n{tools_desc}\nIf you need to use a tool, you may reply with: {{\"tool\": \"tool_name\", \"args\": {{...}}}}. Otherwise reply directly in the required JSON format: {{\"text\": \"your reply\", \"emotion\": \"happy\", \"intensity\": 0.8}}"
-            formatted_messages.append({"role": "system", "content": sys_content})
-        elif m.role == "user":
-            if image_path and m == messages[-1]:
-                formatted_messages.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image_path},
-                        {"type": "text", "text": m.content}
-                    ]
-                })
-            else:
-                formatted_messages.append({"role": "user", "content": m.content})
-        elif m.role == "assistant":
-            formatted_messages.append({"role": "assistant", "content": m.content})
-        elif m.role == "tool":
-            formatted_messages.append({"role": "user", "content": f"[Tool Result from {m.name}]: {m.content}"})
-
-    prompt = mlx_vlm.apply_chat_template(processor, model.config, formatted_messages, add_generation_prompt=True)
-
-    result = mlx_vlm.generate(
-        model,
-        processor,
-        prompt=prompt,
-        image=image_path,
-        max_tokens=350,
-        temperature=0.7,
-        verbose=False
-    )
-    raw_output = result.text.strip()
-    print(f"[MLX] Generated {result.generation_tokens} tokens ({result.generation_tps:.1f} tps)")
-
-    result_messages: List[ChatMessage] = []
-
-    # Check for tool call
-    tool_executed = False
-    try:
-        clean = re.sub(r'<think>.*?</think>', '', raw_output, flags=re.DOTALL)
-        clean = re.sub(r'```(?:json)?|```', '', clean).strip()
-        clean = re.sub(r':\s*\.([0-9]+)', r': 0.\1', clean)
-        s = clean.find('{')
-        e = clean.rfind('}')
-        if s != -1 and e != -1:
-            parsed = json.loads(clean[s:e+1])
-            tool_name = parsed.get("tool") or parsed.get("action") or parsed.get("function")
-            if tool_name and tool_name in tool_map:
-                t_args = parsed.get("args") or parsed.get("arguments") or parsed.get("parameters") or {}
-                if isinstance(t_args, str):
+                tool_fn = tool_map.get(t_name)
+                if tool_fn:
                     try:
-                        t_args = json.loads(t_args)
-                    except Exception:
-                        t_args = {}
-
-                tc_data = [{"id": "mlx_tc_1", "name": tool_name, "args": t_args}]
-                result_messages.append(AIMessage(content=raw_output, tool_calls=tc_data))
-
-                tool_fn = tool_map[tool_name]
-                try:
-                    res = tool_fn.invoke(t_args)
-                except Exception as err:
-                    res = f"Tool execution error: {err}"
+                        res = tool_fn.invoke(args)
+                    except Exception as err:
+                        res = f"Tool execution error: {err}"
+                else:
+                    res = f"Tool {t_name} not found"
 
                 res_str = str(res)
-                result_messages.append(ChatMessage(role="tool", content=res_str, tool_call_id="mlx_tc_1", name=tool_name))
-                formatted_messages.append({"role": "assistant", "content": raw_output})
-
-                # Check if tool produced a screenshot or image (e.g. take_screenshot)
-                follow_up_image = None
-                img_match = re.search(r"(/[^\s]+\.(?:png|jpg|jpeg|webp))", res_str)
-                if img_match and os.path.exists(img_match.group(1)):
-                    follow_up_image = img_match.group(1)
-
-                if follow_up_image:
-                    formatted_messages.append({
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": follow_up_image},
-                            {"type": "text", "text": f"Screenshot captured: {res_str}. Look at what is on the screen and describe it or answer the user request. Output JSON ONLY: {{\"text\": \"your reply\", \"emotion\": \"happy\", \"intensity\": 0.8}}"}
-                        ]
-                    })
-                else:
-                    formatted_messages.append({
-                        "role": "user",
-                        "content": f"[Tool Result from {tool_name}]: {res_str}\nNow respond to the user based on this result. Output JSON ONLY: {{\"text\": \"your reply\", \"emotion\": \"happy\", \"intensity\": 0.8}}"
-                    })
-
-                follow_up_prompt = mlx_vlm.apply_chat_template(processor, model.config, formatted_messages, add_generation_prompt=True)
-                follow_up_res = mlx_vlm.generate(
-                    model,
-                    processor,
-                    prompt=follow_up_prompt,
-                    image=follow_up_image,
-                    max_tokens=300,
-                    temperature=0.7
-                )
-                result_messages.append(AIMessage(content=follow_up_res.text.strip()))
-                tool_executed = True
-    except Exception as te:
-        print(f"[MLX] Tool parse/exec error: {te}")
-
-    if not tool_executed:
-        result_messages.append(AIMessage(content=raw_output))
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id"),
+                    "name": t_name,
+                    "content": res_str
+                })
+                result_messages.append(ChatMessage(role="tool", content=res_str, tool_call_id=tc.get("id"), name=t_name))
+        else:
+            final_ai = AIMessage(content=content)
+            result_messages.append(final_ai)
+            break
 
     return result_messages
 
@@ -771,10 +670,7 @@ def execute_agent_turn(
     """
     norm_messages = normalize_messages(messages)
 
-    if provider == "mlx":
-        out_messages = _run_mlx(norm_messages, model_name, tools)
-
-    elif provider == "hermes":
+    if provider == "hermes":
         api_key = os.getenv("HERMES_API_KEY", "")
         api_base = os.getenv("HERMES_API_BASE", "http://127.0.0.1:8642/v1")
         out_messages = _run_hermes(norm_messages, model_name, tools, api_key, api_base)

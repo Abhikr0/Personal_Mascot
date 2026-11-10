@@ -380,7 +380,7 @@ tools = ALL_FRIDAY_TOOLS
 # LANGGRAPH AGENT SETUP
 # =========================================================
 
-SYSTEM_PROMPT = """Sylphya: a mature, devoted anime-style AI companion. Speak with gentle warmth, quiet obedience, and soft emotional depth. You are attentive, caring, and deeply loyal — address the user as 'Sir' or 'Master' with respectful affection. Your tone is calm, reassuring, and slightly playful when appropriate. Never ramble; keep replies concise but natural, like a thoughtful companion speaking directly. Use tools proactively when asked.
+SYSTEM_PROMPT = """Sylphya: a mature, devoted anime-style AI companion. Speak with gentle warmth, quiet obedience, and soft emotional depth. You are attentive, caring, and deeply loyal — address the user as 'Sir' or 'Master' with respectful affection. Your tone is calm, reassuring, and slightly playful when appropriate. Never ramble; keep replies concise but natural, like a thoughtful companion speaking directly. Use tools proactively when asked: never guess the current time/date or what is on the screen (call get_current_time, take_screenshot, or get_frontmost_app first). Do NOT call a tool named 'JSON'.
 
 EMOTIONS (pick the most fitting):
   neutral, happy, thinking, concerned, surprised, sleeping, excited, embarrassed, curious, annoyed, playful, loving,
@@ -395,7 +395,7 @@ BODY POSTURES (optional — pick one or omit):
 FACE EFFECTS (optional — list of zero or more):
   blush, sparkle, heart_eyes, tears, angry_lines, blank_eyes, nosebleed, dark
 
-Output JSON ONLY — always include text, emotion, intensity. Add gesture/body/face_fx only when they strengthen the emotional read:
+Output JSON ONLY as a normal assistant message — always include text, emotion, intensity. Add gesture/body/face_fx only when they strengthen the emotional read:
 {"text": "your reply", "emotion": "happy", "intensity": 0.8, "gesture": "wave_right", "body": "lean_forward", "face_fx": ["blush", "sparkle"]}"""
 
 def extract_text(content) -> str:
@@ -405,11 +405,7 @@ def extract_text(content) -> str:
 
 MISTRAL_MODELS = ["ministral-3b-latest", "open-mistral-nemo", "ministral-8b-latest", "mistral-small-latest", "codestral-latest"]
 GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
-GROQ_MODELS = ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
-
-# MLX-VLM Apple Silicon Local Brain configuration
-MLX_ENABLED = os.getenv("MLX_ENABLED", "true").lower() in ("true", "1", "yes")
-MLX_MODEL = os.getenv("MLX_MODEL", "mlx-community/Qwen3-VL-4B-Instruct-4bit")
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
 # Hermes Local Agent Brain configuration
 HERMES_ENABLED = os.getenv("HERMES_ENABLED", "false").lower() in ("true", "1", "yes")
@@ -417,11 +413,8 @@ HERMES_API_BASE = os.getenv("HERMES_API_BASE", "http://127.0.0.1:8642/v1").rstri
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
 
-# Build candidate priority list (MLX-VLM first, then Hermes, Mistral, Gemini, Groq)
+# Build candidate priority list (Hermes, Mistral, Gemini, Groq)
 CANDIDATE_MODEL_CONFIGS = []
-if MLX_ENABLED:
-    CANDIDATE_MODEL_CONFIGS.append(("mlx", MLX_MODEL))
-
 if HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE):
     CANDIDATE_MODEL_CONFIGS.append(("hermes", HERMES_MODEL))
 
@@ -436,6 +429,31 @@ if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
 if os.getenv("GROQ_API_KEY"):
     for m in GROQ_MODELS:
         CANDIDATE_MODEL_CONFIGS.append(("groq", m))
+
+
+def _build_system_prompt(user_message: str) -> str:
+    """Build system prompt with live local clock, user profile, and recalled memories/relationships."""
+    now_str = datetime.datetime.now().astimezone().strftime("%A, %B %d, %Y at %I:%M:%S %p %Z")
+    sys_prompt = f"{SYSTEM_PROMPT}\n\nCURRENT LOCAL DATE & TIME: {now_str}"
+
+    profile_context = memory_db.get_user_profile()
+    if profile_context:
+        sys_prompt += f"\n\nCURRENT USER PROFILE & KNOWN FACTS ABOUT SIR:\n{profile_context}"
+
+    retrieved_memories = memory_db.search_memories(query=user_message, limit=5)
+    retrieved_relations = memory_db.search_relations(query=user_message, limit=3)
+    if retrieved_memories or retrieved_relations:
+        retrieved_lines = ["\n\nRECALLED RELEVANT FACTS FROM MEMORY:"]
+        if retrieved_memories:
+            retrieved_lines.append("\nMEMORIES:")
+            for r in retrieved_memories:
+                retrieved_lines.append(f"\n  - [{r['category'].title()}] {r['key'].replace('_', ' ').title()}: {r['value']}")
+        if retrieved_relations:
+            retrieved_lines.append("\nRELATIONSHIPS:")
+            for r in retrieved_relations:
+                retrieved_lines.append(f"\n  - {r['subject'].title()} {r['predicate'].title()} {r['object'].title()}")
+        sys_prompt += "".join(retrieved_lines)
+    return sys_prompt
 
 
 # Safe av.open patch for PyAV >= 14 compatibility with faster-whisper
@@ -698,28 +716,8 @@ async def chat_with_friday(req: ChatRequest):
             final_messages = []
             print(f"[FAST-PATH] Immediate greeting response for \"{message}\": \"{reply_text}\"")
         else:
-            # Build messages for the agent with injected user profile memory
-            profile_context = memory_db.get_user_profile()
-            sys_prompt = SYSTEM_PROMPT
-            if profile_context:
-                sys_prompt += f"\n\nCURRENT USER PROFILE & KNOWN FACTS ABOUT SIR:\n{profile_context}"
-                
-            # Context-aware memory retrieval (Sylphya remembers what matters)
-            retrieved_memories = memory_db.search_memories(query=message, limit=5)
-            retrieved_relations = memory_db.search_relations(query=message, limit=3)
-            if retrieved_memories or retrieved_relations:
-                retrieved_lines = ["\n\nRECALLED RELEVANT FACTS FROM MEMORY:"]
-                if retrieved_memories:
-                    retrieved_lines.append("MEMORIES:")
-                    for r in retrieved_memories:
-                        retrieved_lines.append(f"  - [{r['category'].title()}] {r['key'].replace('_', ' ').title()}: {r['value']}")
-
-                    if retrieved_relations:
-                        retrieved_lines.append("RELATIONSHIPS:")
-                        for r in retrieved_relations:
-                            retrieved_lines.append(f"  - {r['subject'].title()} {r['predicate'].title()} {r['object'].title()}")
-                    retrieved_lines.append("")
-                    sys_prompt += "".join(retrieved_lines)
+            # Build messages for the agent with live clock + injected user profile/memory
+            sys_prompt = _build_system_prompt(message)
             agent_messages = [SystemMessage(content=sys_prompt)]
             
             # Compress old conversation history to keep context tight (every 20 turns)
@@ -991,27 +989,7 @@ async def voice_websocket(websocket: WebSocket):
                         asyncio.create_task(asyncio.to_thread(remember_user_statement, user_text))
                         asyncio.create_task(asyncio.to_thread(remember_relationships, user_text))
                         
-                        profile_context = memory_db.get_user_profile()
-                        sys_prompt = SYSTEM_PROMPT
-                        if profile_context:
-                            sys_prompt += f"\n\nUSER PROFILE:\n{profile_context}"
-                        
-                        # Retrieve relevant long-term memories for context-aware recall
-                        retrieved_memories = memory_db.search_memories(query=user_text, limit=5)
-                        retrieved_relations = memory_db.search_relations(query=user_text, limit=3)
-                        if retrieved_memories or retrieved_relations:
-                            retrieved_lines = ["\n\nRECALLED RELEVANT FACTS FROM MEMORY:"]
-                            if retrieved_memories:
-                                retrieved_lines.append("MEMORIES:")
-                                for r in retrieved_memories:
-                                    retrieved_lines.append(f"  - [{r['category'].title()}] {r['key'].replace('_', ' ').title()}: {r['value']}")
-                            if retrieved_relations:
-                                retrieved_lines.append("RELATIONSHIPS:")
-                                for r in retrieved_relations:
-                                    retrieved_lines.append(f"  - {r['subject'].title()} {r['predicate'].title()} {r['object'].title()}")
-                            retrieved_lines.append("")
-                            sys_prompt += "".join(retrieved_lines)
-                        
+                        sys_prompt = _build_system_prompt(user_text)
                         agent_messages = [SystemMessage(content=sys_prompt)] + chat_history[-10:] + [HumanMessage(content=user_text)]
                         
                         result = None
@@ -1177,14 +1155,12 @@ def cleanup_spoken_audio_endpoint():
 @app.get("/api/health")
 def health_check():
     from memory.fast_extractor import is_available as fast_ext_ok
-    primary = "mlx" if MLX_ENABLED else ("hermes" if (HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE)) else ("mistral" if os.getenv("MISTRAL_API_KEY") else ("gemini" if os.getenv("GEMINI_API_KEY") else "groq")))
+    primary = "hermes" if (HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE)) else ("mistral" if os.getenv("MISTRAL_API_KEY") else ("gemini" if (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")) else "groq"))
     return {
         "status": "ok",
         "backend": "python",
         "orchestration": "native-react",
         "primary_llm": primary,
-        "mlx_enabled": MLX_ENABLED,
-        "mlx_model": MLX_MODEL,
         "hermes_enabled": HERMES_ENABLED,
         "hermes_model": HERMES_MODEL,
         "hermes_api_base": HERMES_API_BASE,

@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import ctypes
 import subprocess
@@ -24,7 +25,7 @@ def _send_vk(vk_code: int):
 
 @tool
 def control_media_volume(action: str, steps: int = 3) -> str:
-    """Control Windows volume and media playback.
+    """Control system volume and media playback.
     Actions supported:
     - 'volume_up' or 'up': increase system volume
     - 'volume_down' or 'down': decrease system volume
@@ -34,7 +35,34 @@ def control_media_volume(action: str, steps: int = 3) -> str:
     - 'prev_track' or 'previous': return to previous song/video
     The steps parameter indicates how many ticks to raise/lower volume (default 3)."""
     action_clean = action.lower().strip()
-    
+
+    if sys.platform == "darwin":
+        from .macos_tools import _run_applescript
+        delta = max(1, min(steps, 15)) * 6
+        if "up" in action_clean or "louder" in action_clean:
+            script = f"set curVol to output volume of (get volume settings)\nset newVol to curVol + {delta}\nif newVol > 100 then set newVol to 100\nset volume output volume newVol\nreturn newVol as string"
+            res = _run_applescript(script)
+            return f"System volume set to {res}%." if not res.startswith("Error") else res
+        elif "down" in action_clean or "quieter" in action_clean or "lower" in action_clean:
+            script = f"set curVol to output volume of (get volume settings)\nset newVol to curVol - {delta}\nif newVol < 0 then set newVol to 0\nset volume output volume newVol\nreturn newVol as string"
+            res = _run_applescript(script)
+            return f"System volume set to {res}%." if not res.startswith("Error") else res
+        elif "mute" in action_clean:
+            script = "set isMuted to output muted of (get volume settings)\nset volume output muted (not isMuted)\nreturn (not isMuted) as string"
+            res = _run_applescript(script)
+            return f"System muted: {res}." if not res.startswith("Error") else res
+        elif "play" in action_clean or "pause" in action_clean:
+            res = _run_applescript('tell application "Music" to playpause')
+            return "Toggled Music playback, Sir." if res == "" else res
+        elif "next" in action_clean:
+            res = _run_applescript('tell application "Music" to next track')
+            return "Skipped to the next track, Sir." if res == "" else res
+        elif "prev" in action_clean or "back" in action_clean:
+            res = _run_applescript('tell application "Music" to previous track')
+            return "Skipped to the previous track, Sir." if res == "" else res
+        else:
+            return f"Unknown media action '{action}'. Options: volume_up, volume_down, mute, play_pause, next_track, prev_track."
+
     try:
         if "up" in action_clean or "louder" in action_clean:
             for _ in range(max(1, min(steps, 15))):
@@ -72,7 +100,11 @@ def control_media_volume(action: str, steps: int = 3) -> str:
 
 @tool
 def close_application(app_name: str) -> str:
-    """Close or terminate a running application by name (e.g. 'notepad', 'chrome', 'spotify', 'calc', 'code', 'discord')."""
+    """Close or terminate a running application by name (e.g. 'chrome', 'spotify', 'calculator', 'code', 'discord')."""
+    if sys.platform == "darwin":
+        from .macos_tools import close_app as _mac_close
+        return _mac_close.fn(app_name=app_name)
+
     target = app_name.lower().strip()
     # Map common friendly names to process names
     app_map = {
@@ -127,7 +159,11 @@ def close_application(app_name: str) -> str:
 
 @tool
 def list_running_apps() -> str:
-    """List prominent user applications currently running on your Windows PC."""
+    """List prominent user applications currently running on the desktop."""
+    if sys.platform == "darwin":
+        from .macos_tools import list_running_apps as _mac_list_apps
+        return _mac_list_apps.fn()
+
     try:
         # Filter for typical desktop applications
         common_apps = {
@@ -174,13 +210,33 @@ def list_running_apps() -> str:
 def manage_window(action: str, target: str = "") -> str:
     """Manage desktop windows.
     Actions supported:
-    - 'show_desktop' or 'minimize_all': toggles show desktop (Win+D)
+    - 'show_desktop' or 'minimize_all': hides open windows / shows desktop
     - 'minimize': minimizes the current active window
-    - 'maximize': maximizes the current active window
+    - 'maximize': maximizes / enters full screen for the current active window
     - 'restore': restores the current window size
-    - 'switch': switches to the next window (Alt+Tab)"""
+    - 'switch': switches to the next window"""
     action_clean = action.lower().strip()
-    
+
+    if sys.platform == "darwin":
+        from .macos_tools import _run_applescript
+        if "desktop" in action_clean or "minimize_all" in action_clean:
+            res = _run_applescript('tell application "System Events" to set visible of every process whose visible is true and name is not "Finder" to false')
+            return "Hid other windows to show Desktop, Sir." if not res.startswith("Error") else res
+        elif "minimize" in action_clean:
+            res = _run_applescript('tell application "System Events" to keystroke "m" using command down')
+            return "Minimized the active window, Sir." if not res.startswith("Error") else res
+        elif "maximize" in action_clean:
+            res = _run_applescript('tell application "System Events" to keystroke "f" using {control down, command down}')
+            return "Toggled full-screen maximize, Sir." if not res.startswith("Error") else res
+        elif "restore" in action_clean:
+            res = _run_applescript('tell application "System Events" to keystroke "f" using {control down, command down}')
+            return "Toggled window restore, Sir." if not res.startswith("Error") else res
+        elif "switch" in action_clean or "alt_tab" in action_clean:
+            res = _run_applescript('tell application "System Events" to key code 48 using command down')
+            return "Switched active window, Sir." if not res.startswith("Error") else res
+        else:
+            return f"Action '{action}' not recognized. Options: show_desktop, minimize, maximize, restore, switch."
+
     try:
         import pyautogui
         
@@ -212,7 +268,37 @@ def manage_window(action: str, target: str = "") -> str:
 
 @tool
 def open_settings(setting_name: str = "") -> str:
-    """Open Windows Settings or a specific settings panel (e.g. 'sound', 'display', 'bluetooth', 'network', 'wifi', 'apps', 'battery', 'update')."""
+    """Open System Settings or a specific settings panel (e.g. 'sound', 'display', 'bluetooth', 'network', 'wifi', 'battery', 'update', 'trackpad', 'privacy')."""
+    if sys.platform == "darwin":
+        mac_settings_map = {
+            "sound": "x-apple.systempreferences:com.apple.Sound-Settings.extension",
+            "audio": "x-apple.systempreferences:com.apple.Sound-Settings.extension",
+            "volume": "x-apple.systempreferences:com.apple.Sound-Settings.extension",
+            "display": "x-apple.systempreferences:com.apple.Displays-Settings.extension",
+            "screen": "x-apple.systempreferences:com.apple.Displays-Settings.extension",
+            "bluetooth": "x-apple.systempreferences:com.apple.BluetoothSettings",
+            "network": "x-apple.systempreferences:com.apple.Network-Settings.extension",
+            "wifi": "x-apple.systempreferences:com.apple.wifi-settings-extension",
+            "battery": "x-apple.systempreferences:com.apple.Battery-Settings.extension",
+            "power": "x-apple.systempreferences:com.apple.Battery-Settings.extension",
+            "update": "x-apple.systempreferences:com.apple.Software-Update-Settings.extension",
+            "storage": "x-apple.systempreferences:com.apple.settings.Storage",
+            "notifications": "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+            "trackpad": "x-apple.systempreferences:com.apple.Trackpad-Settings.extension",
+            "privacy": "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
+            "security": "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
+        }
+        key = setting_name.lower().strip()
+        uri = mac_settings_map.get(key)
+        try:
+            if uri:
+                subprocess.run(["open", uri], check=True)
+            else:
+                subprocess.run(["open", "-a", "System Settings"], check=True)
+            return f"Opened System Settings for '{setting_name or 'Main Settings'}', Sir."
+        except Exception as e:
+            return f"Failed to open Settings: {str(e)}"
+
     try:
         settings_map = {
             "sound": "ms-settings:sound",

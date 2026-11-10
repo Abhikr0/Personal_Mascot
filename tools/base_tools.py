@@ -14,9 +14,9 @@ else:
 
 @tool
 def get_current_time() -> str:
-    """Get the current date and time. Use this when the user asks what time or date it is."""
-    now = datetime.datetime.now()
-    return now.strftime("%A, %B %d, %Y at %I:%M %p")
+    """Get the current local date, time, and timezone. Use this whenever the user asks what time or date it is."""
+    now = datetime.datetime.now().astimezone()
+    return now.strftime("%A, %B %d, %Y at %I:%M:%S %p %Z")
 
 
 import re
@@ -76,6 +76,35 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
+def _fetch_bing_rss(query: str, max_results: int = 4) -> List[Dict[str, str]]:
+    """Fetch web search results from Bing RSS feed (fast, reliable fallback when DDG times out)."""
+    results = []
+    try:
+        import httpx
+        import xml.etree.ElementTree as ET
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
+        resp = httpx.get(
+            "https://www.bing.com/search",
+            params={"q": query, "format": "rss"},
+            headers=headers,
+            timeout=httpx.Timeout(3.5, connect=2.0),
+            follow_redirects=True,
+        )
+        if resp.status_code == 200 and "<item>" in resp.text:
+            root = ET.fromstring(resp.text)
+            for item in root.findall(".//item"):
+                title = _clean_search_text(item.findtext("title", ""))
+                url = (item.findtext("link", "") or "").strip()
+                snippet = _clean_search_text(item.findtext("description", ""))
+                if title and url and snippet and len(snippet) > 10:
+                    results.append({"title": title, "href": url, "body": snippet})
+                    if len(results) >= max_results:
+                        break
+    except Exception:
+        pass
+    return results
+
+
 def _fetch_ddg_instant_answer(query: str) -> Optional[str]:
     """Fetch DuckDuckGo Instant Answer / Abstract if available."""
     try:
@@ -83,7 +112,7 @@ def _fetch_ddg_instant_answer(query: str) -> Optional[str]:
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
         url = "https://api.duckduckgo.com/"
         params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
-        resp = httpx.get(url, params=params, headers=headers, timeout=3.5)
+        resp = httpx.get(url, params=params, headers=headers, timeout=httpx.Timeout(3.0, connect=1.5))
         if resp.status_code == 200:
             data = resp.json()
             abstract = _clean_search_text(data.get("AbstractText", ""))
@@ -106,7 +135,7 @@ def _fetch_ddg_lite(query: str, max_results: int = 4) -> List[Dict[str, str]]:
         from lxml.html import document_fromstring
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
         url = "https://lite.duckduckgo.com/lite/"
-        resp = httpx.post(url, data={"q": query}, headers=headers, timeout=4.0)
+        resp = httpx.post(url, data={"q": query}, headers=headers, timeout=httpx.Timeout(3.0, connect=1.5))
         if resp.status_code == 200 and resp.text:
             tree = document_fromstring(resp.text)
             rows = tree.xpath("//table//tr")
@@ -143,7 +172,7 @@ def _fetch_wikipedia_summary(query: str) -> Optional[Dict[str, str]]:
     """Fetch Wikipedia lead summary for knowledge/entity queries."""
     try:
         import httpx
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"}
+        headers = {"User-Agent": "PersonalMascot/1.0 (https://localhost)"}
         search_url = "https://en.wikipedia.org/w/api.php"
         search_params = {
             "action": "query",
@@ -244,18 +273,19 @@ def web_search(query: str) -> str:
         raw_results: List[Dict] = []
         wiki_info: Optional[Dict] = None
 
-        with ThreadPoolExecutor(max_workers=3) as ex:
+        with ThreadPoolExecutor(max_workers=4) as ex:
             fut_instant = ex.submit(_fetch_ddg_instant_answer, clean_query)
             fut_lite    = ex.submit(_fetch_ddg_lite, clean_query, 4)
+            fut_bing    = ex.submit(_fetch_bing_rss, clean_query, 4)
             # Wikipedia only for non-time-sensitive queries (saves ~700ms on news)
             fut_wiki = ex.submit(_fetch_wikipedia_summary, clean_query) if not is_time_sensitive else None
 
             instant_answer = fut_instant.result()
-            raw_results    = fut_lite.result()
+            raw_results    = fut_lite.result() or fut_bing.result()
             if fut_wiki:
                 wiki_info = fut_wiki.result()
 
-        # If DDG Lite returned nothing, try the DDGS library as last resort
+        # If neither returned results, try DDGS library as last resort
         if not raw_results:
             raw_results = _fetch_ddgs_library(clean_query, max_results=4)
 
@@ -420,9 +450,45 @@ def open_website(target: str) -> str:
         return f"Failed to open website: {str(e)}"
 
 
+def _extract_macos_ocr_text(image_path: str, max_chars: int = 1800) -> str:
+    """Extract on-screen text using native macOS Apple Vision framework (fast mode)."""
+    try:
+        import objc
+        from Foundation import NSURL, NSDictionary, NSBundle
+        bundle = NSBundle.bundleWithPath_("/System/Library/Frameworks/Vision.framework")
+        if not bundle or not bundle.load():
+            return ""
+        VNImageRequestHandler = objc.lookUpClass("VNImageRequestHandler")
+        VNRecognizeTextRequest = objc.lookUpClass("VNRecognizeTextRequest")
+
+        url = NSURL.fileURLWithPath_(image_path)
+        handler = VNImageRequestHandler.alloc().initWithURL_options_(url, NSDictionary.dictionary())
+        req = VNRecognizeTextRequest.alloc().init()
+        req.setRecognitionLevel_(1)  # Fast recognition
+        req.setUsesLanguageCorrection_(False)
+        if not handler.performRequests_error_([req], None):
+            return ""
+
+        lines = []
+        seen = set()
+        for obs in (req.results() or []):
+            cands = obs.topCandidates_(1)
+            if cands and len(cands) > 0:
+                line = str(cands[0].string()).strip()
+                if line and line not in seen:
+                    seen.add(line)
+                    lines.append(line)
+        text = " | ".join(lines)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "..."
+        return text
+    except Exception:
+        return ""
+
+
 @tool
 def take_screenshot() -> str:
-    """Take a screenshot of the user's screen and save it to the Pictures folder."""
+    """Capture the user's current screen (including all apps/windows outside the IDE) and return saved path, visible window stack, and OCR text."""
     try:
         pictures_dir = os.path.join(os.path.expanduser("~"), "Pictures")
         os.makedirs(pictures_dir, exist_ok=True)
@@ -430,8 +496,22 @@ def take_screenshot() -> str:
         filepath = os.path.join(pictures_dir, filename)
 
         if sys.platform == "darwin":
+            from .macos_tools import get_macos_screen_context
+            ctx = get_macos_screen_context()
             subprocess.run(["screencapture", "-x", filepath], check=True)
-            return f"Screenshot successfully saved to {filepath}"
+            ocr_text = _extract_macos_ocr_text(filepath)
+
+            parts = [f"Screenshot saved to {filepath}"]
+            if not ctx["screen_recording_ok"]:
+                parts.append("Warning: macOS Screen Recording permission is NOT granted for the current host process; other apps' windows may be hidden by macOS. Enable Screen Recording in System Settings > Privacy & Security > Screen Recording.")
+            if ctx["frontmost_app"]:
+                parts.append(f"Frontmost app: {ctx['frontmost_app']}")
+            if ctx["visible_windows"]:
+                win_strs = [f"{o}" + (f" ({t})" if t else "") for o, t, _ in ctx["visible_windows"][:6]]
+                parts.append("Visible windows on screen (excluding mascot): " + "; ".join(win_strs))
+            if ocr_text:
+                parts.append(f"Visible screen text (OCR): {ocr_text}")
+            return "\n".join(parts)
         elif sys.platform == "win32":
             ps_cmd = (
                 f"Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
@@ -459,7 +539,7 @@ def take_screenshot() -> str:
 
 @tool
 def open_application(app_name: str) -> str:
-    """Open an application on the desktop. Use this when the user asks you to open an app like Notepad, Chrome, Calculator, VS Code, Spotify, etc."""
+    """Open an application on the desktop. Use this when the user asks you to open an app like Chrome, Safari, Notes, Calculator, VS Code, Spotify, etc."""
     try:
         clean_name = app_name.lower().strip()
         # Web services that should open in the browser
@@ -477,6 +557,14 @@ def open_application(app_name: str) -> str:
         if clean_name in web_services:
             webbrowser.open(web_services[clean_name])
             return f"Opened {app_name} in your browser, Sir."
+
+        if sys.platform == "darwin":
+            from .macos_tools import resolve_macos_app_name
+            resolved = resolve_macos_app_name(app_name)
+            proc = subprocess.run(["open", "-a", resolved], capture_output=True, text=True, timeout=5)
+            if proc.returncode == 0:
+                return f"Opened {resolved}, Sir."
+            return f"Could not open '{resolved}': {proc.stderr.strip() or 'Application not found'}"
 
         app_map = {
             "notepad": "notepad.exe",

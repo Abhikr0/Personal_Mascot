@@ -53,12 +53,14 @@ class MemoryExtractor:
             from groq import Groq
             client = Groq(api_key=groq_key)
             resp = client.chat.completions.create(
-                model="qwen/qwen3.8-27b",
+                model="openai/gpt-oss-120b",
                 messages=[
                     {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.0
+                temperature=0.0,
+                max_tokens=1024,
+                reasoning_effort="low",
             )
             return resp.choices[0].message.content or ""
 

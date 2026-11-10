@@ -1,6 +1,7 @@
 import os
 import sys
 import shutil
+import subprocess
 from .decorator import tool
 
 # Determine base directory
@@ -45,7 +46,7 @@ def _resolve_path(path_str: str) -> str:
 
 @tool
 def create_folder(folder_path: str) -> str:
-    """Create a new folder on Windows.
+    """Create a new folder on the desktop or filesystem.
     Accepts paths like 'Desktop/MyNewProject', 'Downloads/Data', or full paths."""
     try:
         target = _resolve_path(folder_path)
@@ -79,13 +80,18 @@ def create_or_write_file(file_path: str, content: str, mode: str = "write") -> s
 
 @tool
 def open_file(file_path: str) -> str:
-    """Open any file, document, or folder on your PC using its default Windows application (e.g. VS Code, Word, media player, or File Explorer)."""
+    """Open any file, document, or folder on the computer using its default application (e.g. VS Code, Preview, media player, or Finder/File Explorer)."""
     try:
         target = _resolve_path(file_path)
         if not os.path.exists(target):
             return f"File or folder not found: {target}"
-            
-        os.startfile(target)
+
+        if sys.platform == "darwin":
+            subprocess.run(["open", target], check=True)
+        elif sys.platform == "win32":
+            os.startfile(target)
+        else:
+            subprocess.run(["xdg-open", target], check=True)
         return f"Opened '{os.path.basename(target)}' in its default application, Sir."
     except Exception as e:
         return f"Failed to open file: {str(e)}"

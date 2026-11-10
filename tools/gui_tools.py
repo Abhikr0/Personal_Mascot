@@ -1,3 +1,4 @@
+import sys
 import time
 import pyautogui
 from .decorator import tool
@@ -86,6 +87,9 @@ def keyboard_hotkey(keys: str) -> str:
     - 'tab' (press Tab)"""
     try:
         key_list = [k.strip().lower() for k in keys.split(",") if k.strip()]
+        if sys.platform == "darwin":
+            mac_map = {"win": "command", "super": "command", "meta": "command", "cmd": "command", "alt": "option"}
+            key_list = [mac_map.get(k, k) for k in key_list]
         if not key_list:
             return "No valid keys provided to press."
             
