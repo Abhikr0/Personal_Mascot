@@ -487,11 +487,34 @@ def get_local_whisper_model():
     global _local_whisper_model
     if _local_whisper_model is None:
         try:
+            whisper_dir = os.path.join(base_dir, "data", "whisper_models")
+            os.makedirs(whisper_dir, exist_ok=True)
+            os.environ.setdefault("HF_HOME", whisper_dir)
+            os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
             from faster_whisper import WhisperModel
             model_size = os.getenv("LOCAL_WHISPER_MODEL", "base.en").strip()
             print(f"[STT:Local] Loading faster-whisper ({model_size}) on CPU...")
             t0 = time.time()
-            _local_whisper_model = WhisperModel(model_size, device="cpu", compute_type="int8")
+            try:
+                _local_whisper_model = WhisperModel(
+                    model_size, device="cpu", compute_type="int8",
+                    download_root=whisper_dir, local_files_only=True
+                )
+            except Exception:
+                # Force IPv4 during HF Hub download when IPv6 route is unavailable
+                import socket
+                orig_getaddrinfo = socket.getaddrinfo
+                def _ipv4_getaddrinfo(*args, **kwargs):
+                    res = orig_getaddrinfo(*args, **kwargs)
+                    return [r for r in res if r[0] == socket.AF_INET] or res
+                socket.getaddrinfo = _ipv4_getaddrinfo
+                try:
+                    _local_whisper_model = WhisperModel(
+                        model_size, device="cpu", compute_type="int8",
+                        download_root=whisper_dir
+                    )
+                finally:
+                    socket.getaddrinfo = orig_getaddrinfo
             print(f"[STT:Local] faster-whisper ({model_size}) ready in {time.time() - t0:.2f}s")
         except Exception as e:
             print(f"[STT:Local] Failed to load faster-whisper: {e}")
@@ -673,7 +696,7 @@ class ChatRequest(BaseModel):
 
 @app.post("/api/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
-    """Ultra-low latency STT with Indian & British accent handling (Groq Whisper large-v3-turbo primary + Local Whisper fallback)"""
+    """Ultra-low latency STT (Local faster-whisper primary + Groq/Google fallback)"""
     try:
         audio_bytes = await audio.read()
         filename = audio.filename or "recording.webm"
