@@ -242,7 +242,7 @@ def _run_mistral(
             messages=history,
             tools=tool_schemas,
             temperature=0.7,
-            max_tokens=1024
+            max_tokens=2048
         )
         choice = resp.choices[0]
         msg = choice.message
@@ -341,7 +341,7 @@ def _run_gemini(
     config = types.GenerateContentConfig(
         system_instruction=sys_instruction,
         temperature=0.7,
-        max_output_tokens=400,
+        max_output_tokens=2048,
         tools=tool_callables
     )
 
@@ -433,7 +433,7 @@ def _run_groq(
             "messages": history,
             "tools": tool_schemas,
             "temperature": 0.7,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
         }
         if "gpt-oss" in resolved_model:
             req_kwargs["reasoning_effort"] = "low"
@@ -568,6 +568,7 @@ def _run_hermes(
             "model": resolved_model,
             "messages": history,
             "temperature": 0.7,
+            "max_tokens": 2048,
             "stream": False
         }
 

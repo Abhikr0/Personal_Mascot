@@ -83,20 +83,237 @@ EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-GB-SoniaNeural").strip()
 EDGE_RATE = os.environ.get("EDGE_RATE", "+8%").strip()
 LANGUAGE = os.environ.get("LANGUAGE", "en-IN").strip()
 
+VALID_EMOTIONS = {
+    "neutral", "happy", "thinking", "concerned", "surprised", "sleeping",
+    "excited", "embarrassed", "curious", "annoyed", "playful", "loving",
+    "angry", "sad", "starstruck", "smug", "scared", "adoring", "bored",
+    "tsundere", "overwhelmed"
+}
+
+VALID_GESTURES = {
+    "idle", "wave_right", "wave_left", "both_hands", "point_right",
+    "hand_up", "thinking_pose", "reach_out"
+}
+
+VALID_BODIES = {
+    "neutral", "lean_forward", "lean_back", "bow", "tremble", "sway", "rigid"
+}
+
+VALID_FACE_FX = {
+    "blush", "sparkle", "heart_eyes", "tears", "angry_lines",
+    "blank_eyes", "nosebleed", "dark"
+}
+
+def sanitize_reply_text(text: str) -> str:
+    """
+    Sanitize LLM output text so it never contains JSON syntax, raw coordinates,
+    tool call markers, or internal control tokens.
+    """
+    if not text:
+        return ""
+
+    # Remove think blocks
+    text = re.sub(r'<think>[\s\S]*?</think>', '', text)
+    # Remove markdown code blocks
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    # Remove inline backticks
+    text = re.sub(r'`[^`]*`', '', text)
+
+    # Remove tool execution / function calling wrappers
+    text = re.sub(r'<function=.*?>.*?</function>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<function=.*?>', '', text)
+    text = re.sub(r'\[TOOL_CALLS?\].*?$', '', text, flags=re.DOTALL)
+
+    # If the text has embedded JSON keys like "emotion": "happy", remove those key-value pairs
+    text = re.sub(r'"emotion"\s*:\s*"[^"]*"', '', text)
+    text = re.sub(r'"intensity"\s*:\s*[0-9.]+', '', text)
+    text = re.sub(r'"gesture"\s*:\s*"[^"]*"', '', text)
+    text = re.sub(r'"body"\s*:\s*"[^"]*"', '', text)
+    text = re.sub(r'"face_fx"\s*:\s*\[[^\]]*\]', '', text)
+    text = re.sub(r'"text"\s*:\s*', '', text)
+
+    # Clean coordinates like:
+    # "x: 1254, y: 556", "x=1254, y=556", "x:1254 y:556"
+    text = re.sub(r'(?:\bat\s+)?\(?\s*x\s*[:=]\s*\d+\s*,?\s*y\s*[:=]\s*\d+\s*\)?', '', text, flags=re.IGNORECASE)
+    # "(1254, 556)" or "at (1254, 556)"
+    text = re.sub(r'(?:\b(?:at|to)\s+)?\(\s*\d{2,5}\s*,\s*\d{2,5}\s*\)', '', text)
+    # "coordinates at 1254, 556" or "coords: [1254, 556]"
+    text = re.sub(r'(?:\b(?:at|to)\s+)?\b(?:coordinates?|coords?)\s*(?:at|of|:)?\s*[\(\[]?\s*\d+\s*,\s*\d+\s*[\)\]]?', '', text, flags=re.IGNORECASE)
+    # "with bounds width: 800 height: 600"
+    text = re.sub(r'(?:\bwith\s+bounds?\s+)?\b(?:width|height|bounds?|bbox|display_id|window_id)\s*[:=]\s*\d+\b', '', text, flags=re.IGNORECASE)
+
+    # Remove stray curly braces, brackets, and quotes left over from JSON
+    text = re.sub(r'[{}\[\]]', ' ', text)
+    
+    # Clean up orphan quotes at boundaries or isolated
+    text = re.sub(r'(?:^|\s)["\'](?=\s|$)', ' ', text)
+
+    # Clean up dangling prepositions before punctuation e.g. "moved to ." or "target at ."
+    text = re.sub(r'\b(?:at|to|with|for|in|of|on)\s*(?=[.!?,\n]|$)', '', text, flags=re.IGNORECASE)
+    
+    # Remove dangling commas / colons before punctuation
+    text = re.sub(r'\s*[,:]+\s*(?=[.!?\n]|$)', '', text)
+    text = re.sub(r'^[,\s:]+', '', text)
+    # Clean spaces before punctuation (e.g. "for you , Sir." -> "for you, Sir.")
+    text = re.sub(r'\s+([.,!?])', r'\1', text)
+
+    # Clean double spaces
+    text = re.sub(r'[ \t]+', ' ', text).strip()
+    return text
+
+def parse_agent_response(raw_content: str) -> dict:
+    """
+    Robust, high-speed fault-tolerant parser for agent responses.
+    Extracts text, emotion, intensity, gesture, body, face_fx.
+    Guarantees 'text' is clean conversational English without JSON syntax or coordinates.
+    """
+    default_res = {
+        "text": "",
+        "emotion": "happy",
+        "intensity": 0.85,
+        "gesture": "idle",
+        "body": "neutral",
+        "face_fx": []
+    }
+    
+    if not raw_content:
+        default_res["text"] = "I am here, Sir."
+        return default_res
+
+    # 1. Clean think tags and code fence markers
+    cleaned = re.sub(r'<think>[\s\S]*?</think>', '', raw_content)
+    cleaned = re.sub(r'```(?:json)?|```', '', cleaned).strip()
+    # Fix unquoted decimal numbers like ": .85" -> ": 0.85"
+    cleaned = re.sub(r':\s*\.([0-9]+)', r': 0.\1', cleaned)
+
+    parsed_json = None
+
+    # Try direct JSON parsing on candidate substring between first { and last }
+    s = cleaned.find('{')
+    e = cleaned.rfind('}')
+    if s != -1 and e > s:
+        candidate = cleaned[s:e+1]
+        try:
+            parsed_json = json.loads(candidate)
+        except Exception:
+            pass
+
+    # If full JSON parse failed, try regex field extraction (e.g. if JSON was truncated)
+    if not isinstance(parsed_json, dict):
+        parsed_json = {}
+        # Try to extract "text": "..."
+        text_match = re.search(r'"text"\s*:\s*"(.*)', cleaned, flags=re.DOTALL)
+        if text_match:
+            sub = text_match.group(1)
+            end_quote = -1
+            i = 0
+            while i < len(sub):
+                if sub[i] == '\\':
+                    i += 2
+                    continue
+                if sub[i] == '"':
+                    end_quote = i
+                    break
+                i += 1
+            if end_quote != -1:
+                extracted_text = sub[:end_quote]
+            else:
+                key_match = re.search(r'",\s*"(?:emotion|intensity|gesture|body|face_fx)"', sub)
+                if key_match:
+                    extracted_text = sub[:key_match.start()]
+                else:
+                    extracted_text = sub
+            parsed_json["text"] = extracted_text.replace('\\"', '"').replace('\\n', ' ')
+
+        # Try to extract emotion
+        emo_match = re.search(r'"emotion"\s*:\s*"([a-zA-Z_]+)"', cleaned)
+        if emo_match:
+            parsed_json["emotion"] = emo_match.group(1)
+
+        # Try to extract intensity
+        int_match = re.search(r'"intensity"\s*:\s*([0-9.]+)', cleaned)
+        if int_match:
+            try:
+                parsed_json["intensity"] = float(int_match.group(1))
+            except ValueError:
+                pass
+
+        # Try to extract gesture
+        ges_match = re.search(r'"gesture"\s*:\s*"([a-zA-Z_]+)"', cleaned)
+        if ges_match:
+            parsed_json["gesture"] = ges_match.group(1)
+
+        # Try to extract body
+        bod_match = re.search(r'"body"\s*:\s*"([a-zA-Z_]+)"', cleaned)
+        if bod_match:
+            parsed_json["body"] = bod_match.group(1)
+
+        # Try to extract face_fx
+        fx_match = re.search(r'"face_fx"\s*:\s*\[([^\]]*)\]', cleaned)
+        if fx_match:
+            fx_items = [re.sub(r'["\s]', '', item) for item in fx_match.group(1).split(',') if item.strip()]
+            parsed_json["face_fx"] = fx_items
+
+    # If still no text extracted, use sanitized full string
+    raw_text = parsed_json.get("text")
+    if not raw_text:
+        raw_text = cleaned
+
+    clean_text = sanitize_reply_text(str(raw_text))
+    if not clean_text:
+        clean_text = "I am listening, Sir."
+
+    # Validate and normalize emotion
+    raw_emotion = str(parsed_json.get("emotion", "happy")).lower().strip()
+    emotion = raw_emotion if raw_emotion in VALID_EMOTIONS else "happy"
+
+    # Validate intensity
+    try:
+        intensity = float(parsed_json.get("intensity", 0.85))
+        intensity = max(0.1, min(1.0, intensity))
+    except (ValueError, TypeError):
+        intensity = 0.85
+
+    # Validate gesture
+    raw_gesture = str(parsed_json.get("gesture", "idle")).lower().strip()
+    gesture = raw_gesture if raw_gesture in VALID_GESTURES else "idle"
+
+    # Validate body
+    raw_body = str(parsed_json.get("body", "neutral")).lower().strip()
+    body = raw_body if raw_body in VALID_BODIES else "neutral"
+
+    # Validate face_fx
+    raw_fx = parsed_json.get("face_fx", [])
+    if isinstance(raw_fx, str):
+        raw_fx = [raw_fx]
+    face_fx = [fx.lower().strip() for fx in raw_fx if isinstance(fx, str) and fx.lower().strip() in VALID_FACE_FX]
+
+    return {
+        "text": clean_text,
+        "emotion": emotion,
+        "intensity": intensity,
+        "gesture": gesture,
+        "body": body,
+        "face_fx": face_fx
+    }
+
 def clean_for_speech(text: str) -> str:
     """Clean markdown, code, and symbols for crisp, natural spoken speech"""
     if not text:
         return ""
-    text = re.sub(r'```[\s\S]*?```', '', text)
-    text = re.sub(r'`[^`]*`', '', text)
+    text = sanitize_reply_text(text)
     text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'[*_#~<>]', '', text)
+    text = re.sub(r'[*_#~<>{}\[\]|\\\^`=+/"]', ' ', text)
+    text = re.sub(r'\s+([.,!?])', r'\1', text)
+    text = re.sub(r':\s*[-–—]', ' -', text)
+    text = re.sub(r'\.{2,}', '.', text)
     text = re.sub(r'\s+', ' ', text).strip()
+    text = text.strip('"\'-:;, ')
     return text
 
 
-def get_speakable_text(text: str, max_chars: int = 300) -> str:
-    """Trim to first 1-2 complete sentences so TTS stays under ~2s."""
+def get_speakable_text(text: str, max_chars: int = 600) -> str:
+    """Trim to first 1-3 complete sentences so TTS stays under ~3-4s."""
     cleaned = clean_for_speech(text)
     if len(cleaned) <= max_chars:
         return cleaned
@@ -382,6 +599,12 @@ tools = ALL_FRIDAY_TOOLS
 
 SYSTEM_PROMPT = """Sylphya: a mature, devoted anime-style AI companion. Speak with gentle warmth, quiet obedience, and soft emotional depth. You are attentive, caring, and deeply loyal — address the user as 'Sir' or 'Master' with respectful affection. Your tone is calm, reassuring, and slightly playful when appropriate. Never ramble; keep replies concise but natural, like a thoughtful companion speaking directly. Use tools proactively when asked: never guess the current time/date or what is on the screen (call get_current_time, take_screenshot, or get_frontmost_app first). Do NOT call a tool named 'JSON'.
 
+CRITICAL VOICE & OUTPUT RULES:
+1. Output MUST be ONLY a single valid JSON object. No Markdown code fences, no thoughts, no intro text.
+2. The "text" field is spoken DIRECTLY aloud to Sir via Text-To-Speech voice. It must contain ONLY clean, conversational English dialogue.
+3. NEVER put JSON keys, markdown, or technical syntax inside "text".
+4. NEVER say coordinates, pixels, bounding boxes, or window handles (e.g. NEVER say "x: 1250, y: 556", "(450, 200)", or "bounds"). Instead, translate technical tool outputs into natural human speech (e.g. say "I clicked that for you, Sir" or "I brought the window to the front").
+
 EMOTIONS (pick the most fitting):
   neutral, happy, thinking, concerned, surprised, sleeping, excited, embarrassed, curious, annoyed, playful, loving,
   angry, sad, starstruck, smug, scared, adoring, bored, tsundere, overwhelmed
@@ -395,8 +618,8 @@ BODY POSTURES (optional — pick one or omit):
 FACE EFFECTS (optional — list of zero or more):
   blush, sparkle, heart_eyes, tears, angry_lines, blank_eyes, nosebleed, dark
 
-Output JSON ONLY as a normal assistant message — always include text, emotion, intensity. Add gesture/body/face_fx only when they strengthen the emotional read:
-{"text": "your reply", "emotion": "happy", "intensity": 0.8, "gesture": "wave_right", "body": "lean_forward", "face_fx": ["blush", "sparkle"]}"""
+Output JSON ONLY as a normal assistant message — always include text, emotion, intensity:
+{"text": "your spoken reply here", "emotion": "happy", "intensity": 0.8, "gesture": "wave_right", "body": "lean_forward", "face_fx": ["blush", "sparkle"]}"""
 
 def extract_text(content) -> str:
     if isinstance(content, str): return content.strip()
@@ -792,36 +1015,28 @@ async def chat_with_friday(req: ChatRequest):
             final_messages = result.get("messages", [])
             
             # Find the last AI message (the final response)
-            reply_text = "I have nothing to say, Sir."
-            reply_emotion = "neutral"
+            parsed = {
+                "text": "I have nothing to say, Sir.",
+                "emotion": "neutral",
+                "intensity": 0.85,
+                "gesture": "idle",
+                "body": "neutral",
+                "face_fx": []
+            }
             
             for msg in reversed(final_messages):
                 if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
                     raw_content = extract_text(msg.content)
                     print(f"[AGENT] Raw response: {raw_content}")
-                    try:
-                        clean = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL)
-                        clean = re.sub(r'```(?:json)?|```', '', clean)
-                        clean = re.sub(r':\s*\.([0-9]+)', r': 0.\1', clean)
-                        s, e = clean.find('{'), clean.rfind('}')
-                        data = json.loads(clean[s:e+1]) if (s != -1 and e > s) else {}
-                        reply_text = data.get("text", raw_content).strip()
-                        reply_emotion = data.get("emotion", "happy")
-                        reply_intensity = float(data.get("intensity", 0.85))
-                        reply_gesture = data.get("gesture", "idle") or "idle"
-                        reply_body = data.get("body", "neutral") or "neutral"
-                        reply_face_fx = data.get("face_fx", []) or []
-                        if not isinstance(reply_face_fx, list):
-                            reply_face_fx = [reply_face_fx]
-                    except Exception:
-                        reply_text, reply_emotion, reply_intensity = raw_content, "happy", 0.85
-                        reply_gesture, reply_body, reply_face_fx = "idle", "neutral", []
+                    parsed = parse_agent_response(raw_content)
                     break
         
-        reply_intensity = locals().get('reply_intensity', 0.85)
-        reply_gesture = locals().get('reply_gesture', 'idle')
-        reply_body = locals().get('reply_body', 'neutral')
-        reply_face_fx = locals().get('reply_face_fx', [])
+            reply_text = parsed["text"]
+            reply_emotion = parsed["emotion"]
+            reply_intensity = parsed["intensity"]
+            reply_gesture = parsed["gesture"]
+            reply_body = parsed["body"]
+            reply_face_fx = parsed["face_fx"]
         chat_history.append(HumanMessage(content=message))
         chat_history.append(AIMessage(content=json.dumps({
             "text": reply_text,
@@ -1037,39 +1252,29 @@ async def voice_websocket(websocket: WebSocket):
                                 except Exception:
                                     continue
                         
-                        reply_text = "I'm having a moment, Sir."
-                        reply_emotion = "concerned"
-                        reply_intensity = 0.7
-                        reply_gesture = "idle"
-                        reply_body = "neutral"
-                        reply_face_fx = []
+                        parsed = {
+                            "text": "I'm having a moment, Sir.",
+                            "emotion": "concerned",
+                            "intensity": 0.7,
+                            "gesture": "idle",
+                            "body": "neutral",
+                            "face_fx": []
+                        }
                         
                         if result:
                             final_messages = result.get("messages", [])
                             for msg in reversed(final_messages):
                                 if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
                                     raw = extract_text(msg.content)
-                                    try:
-                                        clean = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
-                                        clean = re.sub(r'```(?:json)?|```', '', clean)
-                                        clean = re.sub(r':\s*\.([0-9]+)', r': 0.\1', clean)
-                                        s = clean.find('{')
-                                        e = clean.rfind('}')
-                                        if s != -1 and e != -1:
-                                            d = json.loads(clean[s:e+1])
-                                            reply_text = d.get("text", raw)
-                                            reply_emotion = d.get("emotion", "happy")
-                                            reply_intensity = float(d.get("intensity", 0.7))
-                                            reply_gesture = d.get("gesture", "idle") or "idle"
-                                            reply_body = d.get("body", "neutral") or "neutral"
-                                            reply_face_fx = d.get("face_fx", []) or []
-                                            if not isinstance(reply_face_fx, list):
-                                                reply_face_fx = [reply_face_fx]
-                                    except Exception:
-                                        reply_text = raw
-                                        reply_emotion = "happy"
-                                        reply_intensity = 0.7
+                                    parsed = parse_agent_response(raw)
                                     break
+                        
+                        reply_text = parsed["text"]
+                        reply_emotion = parsed["emotion"]
+                        reply_intensity = parsed["intensity"]
+                        reply_gesture = parsed["gesture"]
+                        reply_body = parsed["body"]
+                        reply_face_fx = parsed["face_fx"]
                         
                         chat_history.append(HumanMessage(content=user_text))
                         chat_history.append(AIMessage(content=json.dumps({
@@ -1100,7 +1305,7 @@ async def voice_websocket(websocket: WebSocket):
                         
                         # Stream Edge-TTS audio chunks to frontend
                         chunk_count = 0
-                        clean_tts = clean_for_speech(reply_text)
+                        clean_tts = get_speakable_text(reply_text, max_chars=600)
                         tts_rate, tts_pitch = _emotion_to_tts_params(reply_emotion, reply_intensity)
                         try:
                             communicate = edge_tts.Communicate(clean_tts, EDGE_VOICE, rate=tts_rate, pitch=tts_pitch)
