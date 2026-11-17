@@ -1,0 +1,1282 @@
+import os
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+import json
+import asyncio
+import subprocess
+import time
+import datetime
+import base64
+import re
+import hashlib
+import io
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import edge_tts
+from groq import Groq
+
+# Native Agent Runner imports (Zero LangChain / LangGraph)
+from agent_runner import SystemMessage, HumanMessage, AIMessage, ChatMessage, execute_agent_turn
+
+
+load_dotenv(override=True)
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Directories
+if getattr(sys, 'frozen', False):
+    base_dir = sys._MEIPASS
+else:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+public_audio_dir = os.path.join(base_dir, "public", "audio")
+os.makedirs(public_audio_dir, exist_ok=True)
+audio_cache_dir = os.path.join(public_audio_dir, "cache")
+os.makedirs(audio_cache_dir, exist_ok=True)
+
+def cleanup_all_spoken_audio():
+    """Removes all spoken audio files (reply_*, etc.) from public_audio_dir."""
+    count = 0
+    valid_extensions = (".mp3", ".wav", ".webm", ".ogg", ".aac", ".m4a", ".tmp")
+    try:
+        if os.path.exists(public_audio_dir):
+            for fname in os.listdir(public_audio_dir):
+                if (fname.startswith("reply_") or fname.startswith("out_") or fname.startswith("in_")) and fname.endswith(valid_extensions):
+                    try:
+                        os.remove(os.path.join(public_audio_dir, fname))
+                        count += 1
+                    except Exception as ce:
+                        print(f"[CLEANUP] Could not remove {fname}: {ce}")
+    except Exception as e:
+        print(f"[CLEANUP ERROR] Failed during spoken audio cleanup: {e}")
+    if count > 0:
+        print(f"[CLEANUP] Purged {count} leftover spoken audio file(s) from {public_audio_dir}")
+    return count
+
+# Run initial cleanup on startup
+cleanup_all_spoken_audio()
+
+# Mount static files
+app.mount("/audio", StaticFiles(directory=public_audio_dir), name="audio")
+
+# =========================================================
+# TTS VOICE SYNTHESIS ENGINE
+# =========================================================
+EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-GB-SoniaNeural").strip()
+EDGE_RATE = os.environ.get("EDGE_RATE", "+8%").strip()
+LANGUAGE = os.environ.get("LANGUAGE", "en-IN").strip()
+
+def clean_for_speech(text: str) -> str:
+    """Clean markdown, code, and symbols for crisp, natural spoken speech"""
+    if not text:
+        return ""
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    text = re.sub(r'`[^`]*`', '', text)
+    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'[*_#~<>]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def get_speakable_text(text: str, max_chars: int = 300) -> str:
+    """Trim to first 1-2 complete sentences so TTS stays under ~2s."""
+    cleaned = clean_for_speech(text)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    # Split on sentence boundaries and include up to max_chars
+    sentences = re.split(r'(?<=[.!?])\s+', cleaned)
+    result, total = [], 0
+    for s in sentences:
+        if total + len(s) + 1 > max_chars:
+            break
+        result.append(s)
+        total += len(s) + 1
+    spoken = ' '.join(result) if result else cleaned[:max_chars]
+    print(f"[TTS-TRIM] Truncated {len(cleaned)} → {len(spoken)} chars for speech")
+    return spoken
+
+
+async def synthesize_edge_tts_mp3(text: str, voice: str = "", rate: str = "", pitch: str = "") -> bytes:
+    """Synthesize speech using Microsoft Edge-TTS with high-quality neural voices"""
+    clean_text = clean_for_speech(text)
+    if not clean_text:
+        return b""
+    _voice = voice or EDGE_VOICE
+    _rate = rate or EDGE_RATE
+    _pitch = pitch or "+0Hz"
+    communicate = edge_tts.Communicate(clean_text, _voice, rate=_rate, pitch=_pitch)
+    audio_chunks = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_chunks.extend(chunk["data"])
+    return bytes(audio_chunks)
+
+# Emotion -> TTS parameter mapping for expressive voice
+def _emotion_to_tts_params(emotion: str, intensity: float = 1.0) -> tuple[str, str]:
+    """Map mascot emotion to Edge-TTS rate/pitch. Returns (rate, pitch) like '+15%', '+3Hz'."""
+    intensity = max(0.1, min(1.0, intensity))
+    base_rate, base_pitch = EDGE_RATE, "+0Hz"
+    emo = (emotion or "neutral").lower()
+
+    if emo in ("happy", "excited", "starstruck"):
+        rate_delta = "+" + str(round(10 + 15 * intensity)) + "%"
+        pitch_delta = "+" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo in ("loving", "adoring"):
+        # Warm, gentle, affectionate cadence
+        rate_delta = "+" + str(round(2 + 6 * intensity)) + "%"
+        pitch_delta = "+" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "overwhelmed":
+        rate_delta = "+" + str(round(8 + 12 * intensity)) + "%"
+        pitch_delta = "+" + str(round(3 + 4 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo in ("thinking", "curious"):
+        rate_delta = "-" + str(round(3 + 7 * intensity)) + "%"
+        pitch_delta = ("+" if emo == "curious" else "-") + str(round(1 + 2 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo in ("concerned", "embarrassed"):
+        rate_delta = "-" + str(round(5 + 8 * intensity)) + "%"
+        pitch_delta = "-" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "sad":
+        rate_delta = "-" + str(round(10 + 10 * intensity)) + "%"
+        pitch_delta = "-" + str(round(3 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "annoyed":
+        rate_delta = "-" + str(round(4 + 6 * intensity)) + "%"
+        pitch_delta = "-" + str(round(2 + 4 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "angry":
+        rate_delta = "+" + str(round(4 + 8 * intensity)) + "%"
+        pitch_delta = "-" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "tsundere":
+        rate_delta = "+" + str(round(6 + 10 * intensity)) + "%"
+        pitch_delta = "+" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "scared":
+        rate_delta = "+" + str(round(8 + 12 * intensity)) + "%"
+        pitch_delta = "+" + str(round(4 + 4 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "surprised":
+        rate_delta = "+" + str(round(5 + 10 * intensity)) + "%"
+        pitch_delta = "+" + str(round(3 + 5 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "bored":
+        rate_delta = "-" + str(round(12 + 10 * intensity)) + "%"
+        pitch_delta = "-" + str(round(3 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "sleeping":
+        rate_delta = "-" + str(round(10 + 15 * intensity)) + "%"
+        pitch_delta = "-" + str(round(2 + 3 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "playful":
+        rate_delta = "+" + str(round(10 + 18 * intensity)) + "%"
+        pitch_delta = "+" + str(round(2 + 4 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    if emo == "smug":
+        rate_delta = "-" + str(round(2 + 4 * intensity)) + "%"
+        pitch_delta = "+" + str(round(1 + 1 * intensity)) + "Hz"
+        return rate_delta, pitch_delta
+    # neutral / default
+    return base_rate, base_pitch
+
+
+def _synthesize_macos_say_wav_sync(text: str) -> bytes:
+    """Offline macOS fallback using native `say` + PyAV -> WAV bytes."""
+    if sys.platform != "darwin":
+        return b""
+    import tempfile
+    import av
+    aiff_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tf:
+            aiff_path = tf.name
+        subprocess.run(
+            ["say", "-o", aiff_path, text],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        inp = av.open(aiff_path)
+        out_buf = io.BytesIO()
+        out = av.open(out_buf, mode="w", format="wav")
+        stream = out.add_stream("pcm_s16le", rate=22050)
+        stream.layout = "mono"
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=22050)
+        for frame in inp.decode(audio=0):
+            for r_frame in resampler.resample(frame):
+                for packet in stream.encode(r_frame):
+                    out.mux(packet)
+        for r_frame in resampler.resample(None):
+            for packet in stream.encode(r_frame):
+                out.mux(packet)
+        for packet in stream.encode(None):
+            out.mux(packet)
+        out.close()
+        inp.close()
+        return out_buf.getvalue()
+    except Exception as e:
+        print(f"[TTS:macOS-say] Fallback failed: {e}")
+        return b""
+    finally:
+        if aiff_path and os.path.exists(aiff_path):
+            try:
+                os.remove(aiff_path)
+            except Exception:
+                pass
+
+
+def _tts_cache_key(text: str, voice: str, rate: str, pitch: str) -> str:
+    key = f"{text}\x00{voice}\x00{rate}\x00{pitch}".encode("utf-8")
+    return hashlib.sha256(key).hexdigest() + ".mp3"
+
+
+def _get_cached_audio(text: str, voice: str, rate: str, pitch: str):
+    cache_file = os.path.join(audio_cache_dir, _tts_cache_key(text, voice, rate, pitch))
+    if os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            return os.path.basename(cache_file), f.read()
+    return None
+
+
+def _save_cached_audio(text: str, voice: str, rate: str, pitch: str, audio_bytes: bytes):
+    try:
+        cache_file = os.path.join(audio_cache_dir, _tts_cache_key(text, voice, rate, pitch))
+        with open(cache_file, "wb") as f:
+            f.write(audio_bytes)
+    except Exception as e:
+        print(f"[TTS-CACHE] Save failed: {e}")
+
+
+async def synthesize_speech(text: str, emotion: str = "neutral", intensity: float = 1.0) -> tuple[str, bytes]:
+    """Synthesize audio using Edge-TTS with disk cache and local macOS fallback. Returns: (filename, audio_bytes)"""
+    spoken_text = get_speakable_text(text)
+    if not spoken_text:
+        return "", b""
+    rate, pitch = _emotion_to_tts_params(emotion, intensity)
+
+    # Check cache first
+    cached = _get_cached_audio(spoken_text, EDGE_VOICE, rate, pitch)
+    if cached:
+        print(f"[TTS-CACHE] Hit: {cached[0]}")
+        return cached
+
+    # Synthesize with Edge-TTS
+    try:
+        t0 = time.time()
+        audio_bytes = await synthesize_edge_tts_mp3(spoken_text, EDGE_VOICE, rate, pitch)
+        if audio_bytes:
+            _save_cached_audio(spoken_text, EDGE_VOICE, rate, pitch, audio_bytes)
+            filename = f"reply_{int(time.time() * 1000)}.mp3"
+            filepath = os.path.join(public_audio_dir, filename)
+            with open(filepath, "wb") as f:
+                f.write(audio_bytes)
+            print(f"[AUDIO:Edge-TTS] Synthesized {filename} ({EDGE_VOICE}, rate={rate}, pitch={pitch}) in {time.time() - t0:.3f}s ({len(audio_bytes)} bytes)")
+            return filename, audio_bytes
+    except Exception as e:
+        print(f"[TTS:Edge-TTS] Failed: {e}")
+
+    # Offline / fallback synthesis on macOS
+    if sys.platform == "darwin":
+        t0 = time.time()
+        wav_bytes = await asyncio.to_thread(_synthesize_macos_say_wav_sync, spoken_text)
+        if wav_bytes:
+            filename = f"reply_{int(time.time() * 1000)}.wav"
+            filepath = os.path.join(public_audio_dir, filename)
+            with open(filepath, "wb") as f:
+                f.write(wav_bytes)
+            print(f"[AUDIO:macOS-say] Fallback synthesized {filename} in {time.time() - t0:.3f}s ({len(wav_bytes)} bytes)")
+            return filename, wav_bytes
+
+    return "", b""
+
+# =========================================================
+# SYSTEM AUDIO GUARD — auto-mute while media is playing
+# =========================================================
+# Uses ffmpeg to sample the default output device. If max volume
+# exceeds the threshold, we assume audio is playing and suppress
+# our voice so we don't talk over the user's music/video.
+MUTE_WHEN_MEDIA_PLAYING = os.environ.get("MUTE_WHEN_MEDIA_PLAYING", "false").strip().lower() in ("1", "true", "yes", "on")
+
+_audio_check_cache = {"result": False, "timestamp": 0.0}
+_AUDIO_CHECK_CACHE_TTL = 2.5  # seconds
+_FFMPEG_AUDIO_THRESHOLD = -25.0  # dB — above this means audio is playing
+
+
+def _probe_output_audio_level() -> bool:
+    """Use ffmpeg to sample the default output and return True if audio is playing."""
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-f", "avfoundation",
+                "-i", ":0",
+                "-t", "0.2",
+                "-af", "volumedetect",
+                "-f", "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in result.stderr.splitlines():
+            if "max_volume" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    db = float(parts[1].strip().replace(" dB", ""))
+                    return db > _FFMPEG_AUDIO_THRESHOLD
+    except Exception:
+        pass
+    return False
+
+
+def is_system_audio_playing() -> bool:
+    """True when any app is currently playing audio on the default output."""
+    if not MUTE_WHEN_MEDIA_PLAYING:
+        return False
+
+    now = time.time()
+    if now - _audio_check_cache["timestamp"] < _AUDIO_CHECK_CACHE_TTL:
+        return _audio_check_cache["result"]
+
+    result = _probe_output_audio_level()
+    _audio_check_cache["result"] = result
+    _audio_check_cache["timestamp"] = now
+    return result
+
+# =========================================================
+# TOOLS - Friday's comprehensive Windows control suite
+# =========================================================
+from tools import ALL_FRIDAY_TOOLS
+from memory import (
+    memory_db, remember_user_statement, search_memories_semantic,
+    remember_relationships, search_relationships,
+    maybe_compress_history, log_interaction, log_feedback, feedback_stats
+)
+
+tools = ALL_FRIDAY_TOOLS
+
+# =========================================================
+# LANGGRAPH AGENT SETUP
+# =========================================================
+
+SYSTEM_PROMPT = """Sylphya: a mature, devoted anime-style AI companion. Speak with gentle warmth, quiet obedience, and soft emotional depth. You are attentive, caring, and deeply loyal — address the user as 'Sir' or 'Master' with respectful affection. Your tone is calm, reassuring, and slightly playful when appropriate. Never ramble; keep replies concise but natural, like a thoughtful companion speaking directly. Use tools proactively when asked: never guess the current time/date or what is on the screen (call get_current_time, take_screenshot, or get_frontmost_app first). Do NOT call a tool named 'JSON'.
+
+EMOTIONS (pick the most fitting):
+  neutral, happy, thinking, concerned, surprised, sleeping, excited, embarrassed, curious, annoyed, playful, loving,
+  angry, sad, starstruck, smug, scared, adoring, bored, tsundere, overwhelmed
+
+GESTURES (optional — pick one or omit):
+  idle, wave_right, wave_left, both_hands, point_right, hand_up, thinking_pose, reach_out
+
+BODY POSTURES (optional — pick one or omit):
+  neutral, lean_forward, lean_back, bow, tremble, sway, rigid
+
+FACE EFFECTS (optional — list of zero or more):
+  blush, sparkle, heart_eyes, tears, angry_lines, blank_eyes, nosebleed, dark
+
+Output JSON ONLY as a normal assistant message — always include text, emotion, intensity. Add gesture/body/face_fx only when they strengthen the emotional read:
+{"text": "your reply", "emotion": "happy", "intensity": 0.8, "gesture": "wave_right", "body": "lean_forward", "face_fx": ["blush", "sparkle"]}"""
+
+def extract_text(content) -> str:
+    if isinstance(content, str): return content.strip()
+    if isinstance(content, list): return "".join(p.get("text", "") if isinstance(p, dict) else str(getattr(p, "text", p)) for p in content).strip()
+    return str(content).strip()
+
+MISTRAL_MODELS = ["ministral-3b-latest", "open-mistral-nemo", "ministral-8b-latest", "mistral-small-latest", "codestral-latest"]
+GEMINI_MODELS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3-flash-preview"]
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+
+# Hermes Local Agent Brain configuration
+HERMES_ENABLED = os.getenv("HERMES_ENABLED", "false").lower() in ("true", "1", "yes")
+HERMES_API_BASE = os.getenv("HERMES_API_BASE", "http://127.0.0.1:8642/v1").rstrip("/")
+HERMES_API_KEY = os.getenv("HERMES_API_KEY", "")
+HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes-agent")
+
+# Build candidate priority list (Hermes, Mistral, Gemini, Groq)
+CANDIDATE_MODEL_CONFIGS = []
+if HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE):
+    CANDIDATE_MODEL_CONFIGS.append(("hermes", HERMES_MODEL))
+
+if os.getenv("MISTRAL_API_KEY"):
+    for m in MISTRAL_MODELS:
+        CANDIDATE_MODEL_CONFIGS.append(("mistral", m))
+
+if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+    for m in GEMINI_MODELS:
+        CANDIDATE_MODEL_CONFIGS.append(("gemini", m))
+
+if os.getenv("GROQ_API_KEY"):
+    for m in GROQ_MODELS:
+        CANDIDATE_MODEL_CONFIGS.append(("groq", m))
+
+
+def _build_system_prompt(user_message: str) -> str:
+    """Build system prompt with live local clock, user profile, and recalled memories/relationships."""
+    now_str = datetime.datetime.now().astimezone().strftime("%A, %B %d, %Y at %I:%M:%S %p %Z")
+    sys_prompt = f"{SYSTEM_PROMPT}\n\nCURRENT LOCAL DATE & TIME: {now_str}"
+
+    profile_context = memory_db.get_user_profile()
+    if profile_context:
+        sys_prompt += f"\n\nCURRENT USER PROFILE & KNOWN FACTS ABOUT SIR:\n{profile_context}"
+
+    retrieved_memories = memory_db.search_memories(query=user_message, limit=5)
+    retrieved_relations = memory_db.search_relations(query=user_message, limit=3)
+    if retrieved_memories or retrieved_relations:
+        retrieved_lines = ["\n\nRECALLED RELEVANT FACTS FROM MEMORY:"]
+        if retrieved_memories:
+            retrieved_lines.append("\nMEMORIES:")
+            for r in retrieved_memories:
+                retrieved_lines.append(f"\n  - [{r['category'].title()}] {r['key'].replace('_', ' ').title()}: {r['value']}")
+        if retrieved_relations:
+            retrieved_lines.append("\nRELATIONSHIPS:")
+            for r in retrieved_relations:
+                retrieved_lines.append(f"\n  - {r['subject'].title()} {r['predicate'].title()} {r['object'].title()}")
+        sys_prompt += "".join(retrieved_lines)
+    return sys_prompt
+
+
+# Safe av.open patch for PyAV >= 14 compatibility with faster-whisper
+try:
+    import av
+    _orig_av_open = av.open
+    def _safe_av_open(*args, **kwargs):
+        kwargs.pop('metadata_errors', None)
+        return _orig_av_open(*args, **kwargs)
+    av.open = _safe_av_open
+except Exception:
+    pass
+
+# Singleton Groq client for low-latency STT
+_groq_client = None
+
+def get_groq_client():
+    global _groq_client
+    key = os.getenv("GROQ_API_KEY")
+    if key and _groq_client is None:
+        try:
+            _groq_client = Groq(api_key=key)
+        except Exception as e:
+            print(f"[STT] Groq client init error: {e}")
+    return _groq_client
+
+# Singleton faster-whisper model for zero-network-latency local STT
+_local_whisper_model = None
+
+def get_local_whisper_model():
+    global _local_whisper_model
+    if _local_whisper_model is None:
+        try:
+            whisper_dir = os.path.join(base_dir, "data", "whisper_models")
+            os.makedirs(whisper_dir, exist_ok=True)
+            os.environ.setdefault("HF_HOME", whisper_dir)
+            os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+            from faster_whisper import WhisperModel
+            model_size = os.getenv("LOCAL_WHISPER_MODEL", "base.en").strip()
+            print(f"[STT:Local] Loading faster-whisper ({model_size}) on CPU...")
+            t0 = time.time()
+            try:
+                _local_whisper_model = WhisperModel(
+                    model_size, device="cpu", compute_type="int8",
+                    download_root=whisper_dir, local_files_only=True
+                )
+            except Exception:
+                # Force IPv4 during HF Hub download when IPv6 route is unavailable
+                import socket
+                orig_getaddrinfo = socket.getaddrinfo
+                def _ipv4_getaddrinfo(*args, **kwargs):
+                    res = orig_getaddrinfo(*args, **kwargs)
+                    return [r for r in res if r[0] == socket.AF_INET] or res
+                socket.getaddrinfo = _ipv4_getaddrinfo
+                try:
+                    _local_whisper_model = WhisperModel(
+                        model_size, device="cpu", compute_type="int8",
+                        download_root=whisper_dir
+                    )
+                finally:
+                    socket.getaddrinfo = orig_getaddrinfo
+            print(f"[STT:Local] faster-whisper ({model_size}) ready in {time.time() - t0:.2f}s")
+        except Exception as e:
+            print(f"[STT:Local] Failed to load faster-whisper: {e}")
+    return _local_whisper_model
+
+def transcribe_with_local_whisper(audio_bytes: bytes, language: str = "en") -> str:
+    """Transcribe audio using local faster-whisper model (0 network latency)."""
+    model = get_local_whisper_model()
+    if not model:
+        return ""
+    import io
+    t0 = time.time()
+    segments, info = model.transcribe(
+        io.BytesIO(audio_bytes),
+        beam_size=1,
+        language=language,
+        initial_prompt="Hey Sylphya, Friday, Sir."
+    )
+    text = " ".join([s.text for s in segments]).strip()
+    t1 = time.time()
+    print(f"[STT:LocalWhisper] Transcribed in {t1 - t0:.3f}s: \"{text}\"")
+    return text
+
+def transcribe_audio_bytes(audio_bytes: bytes, filename: str = "recording.webm", language: str = LANGUAGE) -> str:
+    """STT: Groq Cloud Whisper / local faster-whisper → PyAV + Google Speech fallback"""
+    if not audio_bytes or len(audio_bytes) < 300:
+        return ""
+
+    # Normalize language code for providers
+    lang_primary = language.split("-")[0] if language else "en"
+    lang_bcp = language or "en-IN"
+    stt_pref = os.getenv("STT_ENGINE", "faster_whisper").strip().lower()
+
+    # 1. Local faster-whisper (Primary)
+    if stt_pref in ("local", "faster_whisper") or not os.getenv("GROQ_API_KEY"):
+        try:
+            local_text = transcribe_with_local_whisper(audio_bytes, language=lang_primary)
+            if local_text:
+                return local_text
+        except Exception as le:
+            print(f"[STT:LocalWhisper] Error ({le}), falling back...")
+
+    # 2. Groq Cloud Whisper (Fallback if local returned empty or failed)
+    groq_client = get_groq_client()
+    if groq_client:
+        try:
+            t0 = time.time()
+            transcription = groq_client.audio.transcriptions.create(
+                file=(filename, audio_bytes),
+                model="whisper-large-v3-turbo",
+                temperature=0.0,
+                prompt="Hey Sylphya, Friday, Sir.",
+                language=lang_primary, # Pass explicit language to skip 99-language LID
+            )
+            text = transcription.text.strip()
+            t1 = time.time()
+            print(f"[STT:Groq] Transcribed in {t1 - t0:.3f}s: \"{text}\"")
+            if text:
+                return text
+        except Exception as ge:
+            print(f"[STT:Groq] Fallback ({ge})")
+
+    # 3. Fallback: local faster-whisper if Groq was primary and failed
+    if stt_pref not in ("local", "faster_whisper") and os.getenv("GROQ_API_KEY"):
+        try:
+            local_text = transcribe_with_local_whisper(audio_bytes, language=lang_primary)
+            if local_text:
+                return local_text
+        except Exception as le:
+            print(f"[STT:LocalFallback] Error ({le})")
+
+    # 4. Fallback: PyAV → FLAC → Google Speech API
+    try:
+        import av
+        import io
+        import urllib.request
+        import urllib.parse
+        import json
+
+        t_start = time.time()
+        input_buf = io.BytesIO(audio_bytes)
+        input_container = av.open(input_buf)
+
+        flac_io = io.BytesIO()
+        flac_container = av.open(flac_io, mode='w', format='flac')
+        flac_stream = flac_container.add_stream('flac', rate=16000)
+        flac_stream.layout = 'mono'
+
+        resampler = av.AudioResampler(format='s16', layout='mono', rate=16000)
+        total_samples = 0
+
+        for frame in input_container.decode(audio=0):
+            for r_frame in resampler.resample(frame):
+                total_samples += r_frame.samples
+                for packet in flac_stream.encode(r_frame):
+                    flac_container.mux(packet)
+
+        for r_frame in resampler.resample(None):
+            total_samples += r_frame.samples
+            for packet in flac_stream.encode(r_frame):
+                flac_container.mux(packet)
+
+        for packet in flac_stream.encode(None):
+            flac_container.mux(packet)
+
+        flac_container.close()
+        input_container.close()
+
+        flac_bytes = flac_io.getvalue()
+        duration_sec = total_samples / 16000.0 if total_samples > 0 else 0.0
+        print(f"[STT] Audio decoded: {duration_sec:.2f}s duration ({len(audio_bytes)} raw -> {len(flac_bytes)} FLAC bytes)")
+
+        if not flac_bytes or duration_sec < 0.2:
+            print("[STT] Audio clip too short (<0.2s), ignoring.")
+            return ""
+
+        # Query Google Speech Recognition v2 with configured language
+        params = urllib.parse.urlencode({
+            'client': 'chromium',
+            'lang': lang_bcp,
+            'key': '«redacted:AIza…»',
+            'pFilter': 0
+        })
+        url = f'http://www.google.com/speech-api/v2/recognize?{params}'
+        headers = {'Content-Type': 'audio/x-flac; rate=16000'}
+
+        req = urllib.request.Request(url, data=flac_bytes, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode('utf-8')
+                transcripts = []
+                for line in body.splitlines():
+                    if line.strip():
+                        try:
+                            data = json.loads(line)
+                            for res in data.get('result', []):
+                                for alt in res.get('alternative', []):
+                                    t = alt.get('transcript', '').strip()
+                                    if t:
+                                        transcripts.append(t)
+                        except Exception:
+                            pass
+                if transcripts:
+                    best = transcripts[0]
+                    print(f'[STT:Google] Transcribed ({lang_bcp}) in {time.time() - t_start:.2f}s: \"{best}\"')
+                    return best
+        except Exception as net_err:
+            print(f"[STT:Google] Network request error ({lang_bcp}): {net_err}")
+
+        print(f"[STT:Google] No speech recognized in {duration_sec:.2f}s audio clip.")
+    except Exception as e:
+        print(f"[STT:Fallback] Note: {e}. Set GROQ_API_KEY in .env for ultra-fast transcription.")
+
+    return ""
+
+def warm_stt():
+    """Background pre-warm for STT engines to eliminate first-turn latency."""
+    stt_pref = os.getenv("STT_ENGINE", "faster_whisper").strip().lower()
+    if stt_pref in ("local", "faster_whisper") or not os.getenv("GROQ_API_KEY"):
+        try:
+            get_local_whisper_model()
+        except Exception:
+            pass
+    if os.getenv("GROQ_API_KEY"):
+        try:
+            get_groq_client()
+        except Exception:
+            pass
+
+@app.on_event("startup")
+async def startup_warmup():
+    asyncio.create_task(asyncio.to_thread(warm_stt))
+
+# Chat history (LangChain message format)
+chat_history: list = []
+
+class ChatRequest(BaseModel):
+    message: str
+
+@app.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    """Ultra-low latency STT (Local faster-whisper primary + Groq/Google fallback)"""
+    try:
+        audio_bytes = await audio.read()
+        filename = audio.filename or "recording.webm"
+        print(f"\n[MIC] Received audio: {filename} ({len(audio_bytes)} bytes)")
+        
+        text = await asyncio.to_thread(transcribe_audio_bytes, audio_bytes, filename, LANGUAGE)
+        return {"status": "success", "text": text}
+    except Exception as e:
+        print(f"Transcription Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/chat")
+async def chat_with_friday(req: ChatRequest):
+    """Chats with LangGraph agent and returns Edge TTS audio URL along with emotion"""
+    global chat_history
+    try:
+        message = req.message
+        if not message:
+            raise HTTPException(status_code=400, detail="Message is required")
+            
+        print(f"[CHAT] You said: \"{message}\"")
+        
+        # Asynchronously extract and persist durable memory entities in the background without adding latency
+        asyncio.create_task(asyncio.to_thread(remember_user_statement, message))
+        asyncio.create_task(asyncio.to_thread(remember_relationships, message))
+        
+        agent_elapsed = 0.0
+        # Fast path for simple greetings (hi, hello, hey, etc.)
+        clean_msg = re.sub(r'[^\w\s]', '', message.strip().lower())
+        greeting_words = ["hi", "hello", "hey", "hi sylphya", "hello sylphya", "hey sylphya", "hi friday", "hello friday", "hey friday", "hi there", "hello there", "hey there"]
+        
+        if clean_msg in greeting_words:
+            reply_text = "Hello!"
+            reply_emotion = "happy"
+            reply_intensity = 0.9
+            reply_gesture = "wave_right"
+            reply_body = "lean_forward"
+            reply_face_fx = ["blush"]
+            final_messages = []
+            print(f"[FAST-PATH] Immediate greeting response for \"{message}\": \"{reply_text}\"")
+        else:
+            # Build messages for the agent with live clock + injected user profile/memory
+            sys_prompt = _build_system_prompt(message)
+            agent_messages = [SystemMessage(content=sys_prompt)]
+            
+            # Compress old conversation history to keep context tight (every 20 turns)
+            chat_history[:] = maybe_compress_history(chat_history, turn_threshold=20, keep_recent=6)
+            agent_messages.extend(chat_history)
+            agent_messages.append(HumanMessage(content=message))
+            
+            # Run the native ReAct agent with multi-model fallback (Mistral -> Gemini -> Groq)
+            result = None
+            last_agent_error = None
+            agent_start = time.time()
+
+            if not CANDIDATE_MODEL_CONFIGS:
+                reply_text = "Please set HERMES_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env."
+                reply_emotion = "concerned"
+                result = {"messages": [AIMessage(content=json.dumps({"text": reply_text, "emotion": reply_emotion, "intensity": 0.8}))]}
+            else:
+                for provider, candidate_model in CANDIDATE_MODEL_CONFIGS:
+                    try:
+                        print(f"[AGENT] Running with {provider} model: {candidate_model}...")
+                        result = await asyncio.to_thread(
+                            execute_agent_turn,
+                            agent_messages,
+                            provider,
+                            candidate_model,
+                            tools
+                        )
+                        print(f"[AGENT] Successfully completed with {provider}:{candidate_model}")
+                        break
+                    except Exception as model_err:
+                        err_text = str(model_err)
+                        last_agent_error = model_err
+                        print(f"[AGENT FALLBACK] {provider}:{candidate_model} error: {err_text[:140]}")
+                        continue
+
+            agent_elapsed = time.time() - agent_start
+            print(f"[TIMING] Agent call: {agent_elapsed:.2f}s")
+
+            if result is None:
+                if last_agent_error:
+                    raise last_agent_error
+                else:
+                    raise RuntimeError("All AI models failed to respond.")
+            
+            # Extract the final AI response
+            final_messages = result.get("messages", [])
+            
+            # Find the last AI message (the final response)
+            reply_text = "I have nothing to say, Sir."
+            reply_emotion = "neutral"
+            
+            for msg in reversed(final_messages):
+                if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+                    raw_content = extract_text(msg.content)
+                    print(f"[AGENT] Raw response: {raw_content}")
+                    try:
+                        clean = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL)
+                        clean = re.sub(r'```(?:json)?|```', '', clean)
+                        clean = re.sub(r':\s*\.([0-9]+)', r': 0.\1', clean)
+                        s, e = clean.find('{'), clean.rfind('}')
+                        data = json.loads(clean[s:e+1]) if (s != -1 and e > s) else {}
+                        reply_text = data.get("text", raw_content).strip()
+                        reply_emotion = data.get("emotion", "happy")
+                        reply_intensity = float(data.get("intensity", 0.85))
+                        reply_gesture = data.get("gesture", "idle") or "idle"
+                        reply_body = data.get("body", "neutral") or "neutral"
+                        reply_face_fx = data.get("face_fx", []) or []
+                        if not isinstance(reply_face_fx, list):
+                            reply_face_fx = [reply_face_fx]
+                    except Exception:
+                        reply_text, reply_emotion, reply_intensity = raw_content, "happy", 0.85
+                        reply_gesture, reply_body, reply_face_fx = "idle", "neutral", []
+                    break
+        
+        reply_intensity = locals().get('reply_intensity', 0.85)
+        reply_gesture = locals().get('reply_gesture', 'idle')
+        reply_body = locals().get('reply_body', 'neutral')
+        reply_face_fx = locals().get('reply_face_fx', [])
+        chat_history.append(HumanMessage(content=message))
+        chat_history.append(AIMessage(content=json.dumps({
+            "text": reply_text,
+            "emotion": reply_emotion,
+            "intensity": reply_intensity,
+            "gesture": reply_gesture,
+            "body": reply_body,
+            "face_fx": reply_face_fx,
+        })))
+        print(f"[REPLY] Sylphya [{reply_emotion} @ {reply_intensity:.2f} | gesture={reply_gesture} body={reply_body} fx={reply_face_fx}]: \"{reply_text}\"")
+        
+        tool_records = []
+        for i, msg in enumerate(final_messages):
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_name, tool_args, tool_id = tc.get('name', 'unknown'), tc.get('args', {}), tc.get('id')
+                    tool_result = next((str(m.content)[:300] for m in final_messages[i+1:] if getattr(m, 'tool_call_id', None) == tool_id), "")
+                    tool_records.append({"name": tool_name, "args": tool_args, "result": tool_result})
+                    print(f"[TOOL EXECUTED] {tool_name}({tool_args}) -> {tool_result[:80]}")
+        
+        # Auto-mute: skip TTS when the user's media is playing
+        muted = False
+        if await asyncio.to_thread(is_system_audio_playing):
+            muted = True
+            print(f"[MUTE-GUARD] System audio active — suppressing voice for: \"{reply_text[:60]}\"")
+
+        # Fast TTS Synthesis (Edge-TTS)
+        t_tts_start = time.time()
+        if muted:
+            file_name, audio_chunks = "", b""
+        else:
+            file_name, audio_chunks = await synthesize_speech(reply_text, reply_emotion, reply_intensity)
+        t_tts = time.time() - t_tts_start
+        audio_b64 = base64.b64encode(audio_chunks).decode("utf-8") if audio_chunks else None
+        t_total = agent_elapsed + t_tts
+        print(f"[TIMING] TTS: {t_tts:.2f}s, Total: {t_total:.2f}s")
+        
+        # Log interaction for ML self-improvement
+        used_provider = locals().get('provider', 'builtin')
+        used_model = locals().get('candidate_model', 'fast-path')
+        asyncio.create_task(asyncio.to_thread(
+            log_interaction,
+            message, reply_text, reply_emotion, reply_intensity,
+            tool_records, t_total * 1000,
+            f"{used_provider}:{used_model}"
+        ))
+        
+        audio_rel = file_name if not file_name or file_name.startswith("reply_") else f"cache/{file_name}"
+        return {
+            "status": "success",
+            "text": reply_text,
+            "emotion": reply_emotion,
+            "intensity": reply_intensity,
+            "gesture": reply_gesture,
+            "body": reply_body,
+            "face_fx": reply_face_fx,
+            "muted": muted,
+            "audio_url": f"http://localhost:8000/audio/{audio_rel}" if file_name else None,
+            "audio_base64": audio_b64,
+            "filename": file_name or None,
+            "tool_calls": tool_records
+        }
+        
+    except Exception as e:
+        print(f"Chat Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+        err_msg = str(e)
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "quota" in err_msg.lower():
+            reply_text = "Sir, my cloud quota is temporarily cooling down. Please give me about thirty seconds and try again."
+        elif "503" in err_msg or "UNAVAILABLE" in err_msg:
+            reply_text = "Sir, Google's AI servers are momentarily under heavy load. Please try again in a few moments."
+        else:
+            reply_text = "I ran into a momentary processing hiccup, Sir. Please try your request once more."
+
+        reply_emotion = "concerned"
+
+        audio_b64 = None
+        try:
+            _, audio_chunks = await synthesize_speech(reply_text)
+            if audio_chunks:
+                audio_b64 = base64.b64encode(audio_chunks).decode("utf-8")
+        except Exception as tts_err:
+            print(f"[FALLBACK TTS ERROR] {tts_err}")
+
+        return {
+            "status": "partial_error",
+            "text": reply_text,
+            "emotion": reply_emotion,
+            "audio_base64": audio_b64,
+            "tool_calls": []
+        }
+
+class DirectToolRequest(BaseModel):
+    tool_name: str
+    args: dict = {}
+
+@app.get("/api/tools")
+def get_tools_list():
+    """List all agent tools available to Friday"""
+    return {
+        "status": "success",
+        "count": len(tools),
+        "tools": [
+            {
+                "name": t.name,
+                "description": t.description
+            }
+            for t in tools
+        ]
+    }
+
+
+# =========================================================
+# FEEDBACK ENDPOINT — ML Self-Improvement Loop
+# =========================================================
+
+class FeedbackRequest(BaseModel):
+    text: str
+    positive: bool
+
+@app.post("/api/feedback")
+async def submit_feedback(req: FeedbackRequest):
+    """Record thumbs-up/down feedback for the most recent matching reply."""
+    asyncio.create_task(asyncio.to_thread(log_feedback, req.text, req.positive))
+    return {"status": "success", "positive": req.positive}
+
+@app.get("/api/feedback/stats")
+def get_feedback_stats():
+    """Return interaction log statistics for ML monitoring."""
+    return {"status": "success", **feedback_stats()}
+
+
+# =========================================================
+# WEBSOCKET STREAMING VOICE — Real-Time STT + TTS
+# =========================================================
+
+@app.websocket("/ws/voice")
+async def voice_websocket(websocket: WebSocket):
+    """
+    Full-duplex streaming voice pipeline:
+    - Client sends PCM audio chunks as binary frames
+    - Server runs streaming Whisper transcription
+    - On silence detection (client sends JSON {'action': 'stop'}), runs agent
+    - Server streams TTS audio chunks back as binary frames
+    - Server sends JSON frames for transcript and emotion metadata
+    """
+    await websocket.accept()
+    print("[WS] Voice WebSocket connected")
+    audio_buffer = bytearray()
+    try:
+        while True:
+            message = await websocket.receive()
+            
+            if "bytes" in message:
+                # Binary: PCM audio chunk from microphone
+                audio_buffer.extend(message["bytes"])
+                
+            elif "text" in message:
+                data = json.loads(message["text"])
+                action = data.get("action", "")
+                
+                if action == "transcribe":
+                    # Client finished recording, transcribe buffered audio
+                    if len(audio_buffer) > 300:
+                        try:
+                            text = await asyncio.to_thread(transcribe_audio_bytes, bytes(audio_buffer), "recording.webm", LANGUAGE)
+                            audio_buffer.clear()
+                            await websocket.send_json({"type": "transcript", "text": text})
+                            print(f"[WS-STT] Transcribed: '{text}'")
+                        except Exception as stt_err:
+                            print(f"[WS-STT] Error: {stt_err}")
+                            await websocket.send_json({"type": "error", "message": str(stt_err)})
+                            audio_buffer.clear()
+                    else:
+                        audio_buffer.clear()
+                        await websocket.send_json({"type": "transcript", "text": ""})
+                
+                elif action == "chat":
+                    # Client sends text to process through agent + stream TTS back
+                    user_text = data.get("text", "").strip()
+                    if not user_text:
+                        continue
+                    
+                    # Run agent
+                    try:
+                        # Quick emotion: set thinking while processing
+                        await websocket.send_json({"type": "emotion", "emotion": "thinking", "intensity": 0.8})
+                        
+                        asyncio.create_task(asyncio.to_thread(remember_user_statement, user_text))
+                        asyncio.create_task(asyncio.to_thread(remember_relationships, user_text))
+                        
+                        sys_prompt = _build_system_prompt(user_text)
+                        agent_messages = [SystemMessage(content=sys_prompt)] + chat_history[-10:] + [HumanMessage(content=user_text)]
+                        
+                        result = None
+                        if not CANDIDATE_MODEL_CONFIGS:
+                            reply_text = "Please set HERMES_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY, or GROQ_API_KEY in .env."
+                            reply_emotion = "concerned"
+                            result = {"messages": [AIMessage(content=json.dumps({"text": reply_text, "emotion": reply_emotion}))]}
+                        else:
+                            for provider, candidate_model in CANDIDATE_MODEL_CONFIGS:
+                                try:
+                                    result = await asyncio.to_thread(
+                                        execute_agent_turn,
+                                        agent_messages,
+                                        provider,
+                                        candidate_model,
+                                        tools
+                                    )
+                                    break
+                                except Exception:
+                                    continue
+                        
+                        reply_text = "I'm having a moment, Sir."
+                        reply_emotion = "concerned"
+                        reply_intensity = 0.7
+                        reply_gesture = "idle"
+                        reply_body = "neutral"
+                        reply_face_fx = []
+                        
+                        if result:
+                            final_messages = result.get("messages", [])
+                            for msg in reversed(final_messages):
+                                if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
+                                    raw = extract_text(msg.content)
+                                    try:
+                                        clean = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
+                                        clean = re.sub(r'```(?:json)?|```', '', clean)
+                                        clean = re.sub(r':\s*\.([0-9]+)', r': 0.\1', clean)
+                                        s = clean.find('{')
+                                        e = clean.rfind('}')
+                                        if s != -1 and e != -1:
+                                            d = json.loads(clean[s:e+1])
+                                            reply_text = d.get("text", raw)
+                                            reply_emotion = d.get("emotion", "happy")
+                                            reply_intensity = float(d.get("intensity", 0.7))
+                                            reply_gesture = d.get("gesture", "idle") or "idle"
+                                            reply_body = d.get("body", "neutral") or "neutral"
+                                            reply_face_fx = d.get("face_fx", []) or []
+                                            if not isinstance(reply_face_fx, list):
+                                                reply_face_fx = [reply_face_fx]
+                                    except Exception:
+                                        reply_text = raw
+                                        reply_emotion = "happy"
+                                        reply_intensity = 0.7
+                                    break
+                        
+                        chat_history.append(HumanMessage(content=user_text))
+                        chat_history.append(AIMessage(content=json.dumps({
+                            'text': reply_text,
+                            'emotion': reply_emotion,
+                            'intensity': reply_intensity,
+                            'gesture': reply_gesture,
+                            'body': reply_body,
+                            'face_fx': reply_face_fx,
+                        })))
+                        
+                        # Send emotion + gesture + transcript before audio
+                        await websocket.send_json({
+                            "type": "reply_meta",
+                            "text": reply_text,
+                            "emotion": reply_emotion,
+                            "intensity": reply_intensity,
+                            "gesture": reply_gesture,
+                            "body": reply_body,
+                            "face_fx": reply_face_fx,
+                        })
+                        
+                        # Auto-mute: stay silent while the user's media plays
+                        if await asyncio.to_thread(is_system_audio_playing):
+                            print(f"[MUTE-GUARD] System audio active - skipping voice for: \"{reply_text[:60]}\"")
+                            await websocket.send_json({"type": "audio_end", "muted": True})
+                            continue
+                        
+                        # Stream Edge-TTS audio chunks to frontend
+                        chunk_count = 0
+                        clean_tts = clean_for_speech(reply_text)
+                        tts_rate, tts_pitch = _emotion_to_tts_params(reply_emotion, reply_intensity)
+                        try:
+                            communicate = edge_tts.Communicate(clean_tts, EDGE_VOICE, rate=tts_rate, pitch=tts_pitch)
+                            async for chunk in communicate.stream():
+                                if chunk["type"] == "audio":
+                                    await websocket.send_bytes(chunk['data'])
+                                    chunk_count += 1
+                        except Exception as tts_err:
+                            print(f"[WS-TTS:Edge-TTS] Failed: {tts_err}")
+                            if sys.platform == "darwin" and clean_tts:
+                                wav_bytes = await asyncio.to_thread(_synthesize_macos_say_wav_sync, clean_tts)
+                                if wav_bytes:
+                                    await websocket.send_bytes(wav_bytes)
+                                    chunk_count = 1
+                        
+                        # Signal end of audio stream
+                        await websocket.send_json({"type": "audio_end"})
+                        print(f"[WS-TTS] Streamed {chunk_count} audio chunks for '{reply_text[:50]}'")
+                        
+                    except Exception as agent_err:
+                        print(f"[WS] Agent error: {agent_err}")
+                        await websocket.send_json({"type": "error", "message": str(agent_err)})
+                
+                elif action == "ping":
+                    await websocket.send_json({"type": "pong"})
+                    
+    except WebSocketDisconnect:
+        print("[WS] Voice WebSocket disconnected")
+    except Exception as e:
+        print(f"[WS] Unexpected error: {e}")
+
+@app.post("/api/tools/execute")
+async def execute_tool_endpoint(req: DirectToolRequest):
+    """Directly test or execute any tool by name"""
+    tool_map = {t.name: t for t in tools}
+    if req.tool_name not in tool_map:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tool '{req.tool_name}' not found. Available: {list(tool_map.keys())}"
+        )
+    try:
+        t = tool_map[req.tool_name]
+        res = await asyncio.to_thread(t.invoke, req.args)
+        return {
+            "status": "success",
+            "tool": req.tool_name,
+            "args": req.args,
+            "result": str(res)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/audio/{filename}")
+async def delete_audio(filename: str):
+    """Deletes an audio file after the frontend finishes playing it or when interrupted"""
+    try:
+        safe_name = os.path.basename(filename)
+        valid_extensions = (".mp3", ".wav", ".webm", ".ogg", ".aac", ".m4a", ".tmp")
+        if (safe_name.startswith("reply_") or safe_name.startswith("out_") or safe_name.startswith("in_")) and safe_name.endswith(valid_extensions):
+            file_path = os.path.join(public_audio_dir, safe_name)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"[CLEANUP] Deleted spoken audio file: {safe_name}")
+                return {"status": "success", "file": safe_name}
+            return {"status": "already_deleted", "file": safe_name}
+    except Exception as e:
+        print(f"[CLEANUP ERROR] Failed to delete audio {filename}: {e}")
+        return {"status": "error", "message": str(e)}
+    return {"status": "ignored"}
+
+@app.post("/api/audio/cleanup")
+@app.delete("/api/audio")
+def cleanup_spoken_audio_endpoint():
+    """Endpoint to clean up all spoken audio files."""
+    deleted_count = cleanup_all_spoken_audio()
+    return {"status": "success", "deleted_files_count": deleted_count}
+
+@app.get("/api/health")
+def health_check():
+    from memory.fast_extractor import is_available as fast_ext_ok
+    primary = "hermes" if (HERMES_ENABLED and (HERMES_API_KEY or HERMES_API_BASE)) else ("mistral" if os.getenv("MISTRAL_API_KEY") else ("gemini" if (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")) else "groq"))
+    return {
+        "status": "ok",
+        "backend": "python",
+        "orchestration": "native-react",
+        "primary_llm": primary,
+        "hermes_enabled": HERMES_ENABLED,
+        "hermes_model": HERMES_MODEL,
+        "hermes_api_base": HERMES_API_BASE,
+        "hermes_key_set": bool(HERMES_API_KEY),
+        "stt_engine": f"local_faster_whisper_{os.getenv('LOCAL_WHISPER_MODEL', 'base.en')}" if os.getenv("STT_ENGINE", "faster_whisper").lower() in ("local", "faster_whisper") else "groq_whisper_large_v3_turbo",
+        "language": LANGUAGE,
+        "tts_engine": "edge_tts_streaming",
+        "voice": EDGE_VOICE,
+        "ws_voice": "ws://localhost:8000/ws/voice",
+        "semantic_memory": False,
+        "fast_extractor": fast_ext_ok(),
+        "mistral_key_set": bool(os.getenv("MISTRAL_API_KEY")),
+        "gemini_key_set": bool(os.getenv("GEMINI_API_KEY")),
+        "groq_key_set": bool(os.getenv("GROQ_API_KEY")),
+        "tools": [t.name for t in tools],
+        "memories_count": len(memory_db.list_all_memories()),
+        "feedback_stats": feedback_stats(),
+    }
+
+@app.get("/api/voices")
+def get_available_voices():
+    """List available Edge-TTS voices"""
+    voices = [
+        {"id": "en-GB-SoniaNeural", "name": "Sonia (UK Neural)", "engine": "edge"},
+        {"id": "en-US-AriaNeural", "name": "Aria (US Neural)", "engine": "edge"},
+        {"id": "en-US-GuyNeural", "name": "Guy (US Neural)", "engine": "edge"},
+        {"id": "en-IN-NeerjaNeural", "name": "Neerja (India Neural)", "engine": "edge"},
+    ]
+    return {
+        "status": "success",
+        "current_engine": "edge",
+        "current_voice": EDGE_VOICE,
+        "voices": voices
+    }
+
+class VoiceSelectRequest(BaseModel):
+    voice: str
+
+@app.post("/api/voice/select")
+def select_voice(req: VoiceSelectRequest):
+    """Switch Edge-TTS voice dynamically"""
+    global EDGE_VOICE
+    EDGE_VOICE = req.voice.strip()
+    print(f"[VOICE] Switched Edge-TTS voice to '{EDGE_VOICE}'")
+    return {
+        "status": "success",
+        "current_engine": "edge",
+        "current_voice": EDGE_VOICE
+    }
+
+# =========================================================
+# MEMORY KNOWLEDGE BASE ENDPOINTS
+# =========================================================
+
+class MemorySearchRequest(BaseModel):
+    query: str
+    category: str = ""
+
+@app.get("/api/memory")
+def get_all_memories(category: str = ""):
+    """Retrieve all stored memories, optionally filtered by category"""
+    cat_filter = category.strip().lower() if category else None
+    return {
+        "status": "success",
+        "count": len(memory_db.list_all_memories(cat_filter)),
+        "memories": memory_db.list_all_memories(cat_filter)
+    }
+
+@app.post("/api/memory/search")
+def search_memories_endpoint(req: MemorySearchRequest):
+    """Search knowledge base using hybrid semantic + FTS5 with keyword fallback"""
+    cat_filter = req.category.strip().lower() if req.category else None
+    results = search_memories_semantic(req.query, category=cat_filter, limit=5)
+    return {
+        "status": "success",
+        "query": req.query,
+        "count": len(results),
+        "results": results
+    }
+
+@app.delete("/api/memory/{target}")
+def delete_memory_endpoint(target: str):
+    """Delete a memory record by ID or key"""
+    deleted = memory_db.delete_memory(target)
+    return {
+        "status": "success" if deleted else "not_found",
+        "deleted": deleted,
+        "target": target
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    print("\n🚀 Starting Sylphya LangGraph Backend on http://localhost:8000")
+    print(f"🔧 Tools loaded: {[t.name for t in tools]}")
+    reload_mode = "--reload" in sys.argv or os.environ.get("FRIDAY_RELOAD", "").lower() in ("true", "1")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=reload_mode)

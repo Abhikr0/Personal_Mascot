@@ -1,0 +1,1583 @@
+import { useEffect, useRef, useState, useCallback } from 'react';
+import * as PIXI from 'pixi.js';
+import { Live2DModel } from 'pixi-live2d-display';
+import './index.css';
+
+// Register PIXI on window and register Ticker for pixi-live2d-display
+(window as any).PIXI = PIXI;
+PIXI.utils.skipHello();
+Live2DModel.registerTicker(PIXI.Ticker);
+
+import {
+  JIAN_CHARACTER,
+  GESTURE_MAP,
+  BODY_MAP,
+  FACE_FX_MAP,
+  type AssistantEmotion,
+  type GestureToken,
+  type BodyToken,
+  type FaceEffectToken,
+} from './characters';
+
+type AppState = 'loading' | 'ready' | 'error';
+type ListenState = 'idle' | 'listening' | 'processing' | 'speaking';
+
+// Window Dimensions (un-cropped generous framing)
+const WIN_W = 440;
+const WIN_H = 540;
+
+// Wake Word & Intent Regex Patterns
+const WAKE_WORD_PATTERN = /^(?:(?:hey|hi|hello|ok|okay|yo|listen)\s+)?(?:sylphya|sylvia|silvia|sophia|sulphur|silfi|friday)\b[,:\s]*/i;
+const ANY_WAKE_WORD_PATTERN = /\b(?:sylphya|sylvia|silvia|sophia|sulphur|silfi|friday)\b/i;
+const WAKE_WORD_CLEAN_PATTERN = /\b(?:sylphya|sylvia|silvia|sophia|sulphur|silfi|friday)\b/gi;
+const GREETING_REGEX = /^(hi|hello|hey)(\s+(sylphya|sylvia|silvia|sophia|sulphur|friday|there))?$/i;
+const WAKE_COMMAND_REGEX = /^(?:(?:hey|hi)?\s*(?:sylphya|sylvia|silvia|sophia|sulphur|friday)[,:\s]*)?(?:wake\s*up|wake)\b/i;
+const SLEEP_COMMAND_REGEX = /^(?:(?:hey|hi|hello|ok)?\s*(?:sylphya|sylvia|silvia|sophia|sulphur|friday)[,:\s]*)?(?:(?:go\s+to\s+)?sleep|take\s+a\s+(?:nap|rest)|stop\s+listening|mute\s+yourself|good\s*night)\b/i;
+
+// Safe Electron IPC accessor
+function getElectronIpc() {
+  if (typeof window === 'undefined') return null;
+  const w = window as any;
+  if (w.ipcRenderer) return w.ipcRenderer;
+  if (typeof w.require === 'function') {
+    try {
+      const electron = w.require('electron');
+      return electron?.ipcRenderer || electron;
+    } catch { }
+  }
+  return null;
+}
+
+// Global AudioContext for Lip Sync
+let globalAudioCtx: AudioContext | null = null;
+const getAudioContext = () => {
+  if (!globalAudioCtx) {
+    globalAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+  }
+  return globalAudioCtx;
+};
+
+// Pure in-memory base64 decoder
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binaryString = window.atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+// Main App Component
+function App() {
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const appRef = useRef<PIXI.Application | null>(null);
+  const modelRef = useRef<any>(null);
+
+  const [state, setState] = useState<AppState>('loading');
+  const [errorMsg, setErrorMsg] = useState('');
+  const [listenState, setListenState] = useState<ListenState>('idle');
+  const [subtitle, setSubtitle] = useState<string | null>(null);
+
+  // Always-On / Hands-Free Wake Word Mode
+  const [isAlwaysOn, setIsAlwaysOn] = useState<boolean>(() => {
+    try {
+      return (
+        localStorage.getItem('sylphya_always_on') === 'true' ||
+        localStorage.getItem('friday_always_on') === 'true'
+      );
+    } catch {
+      return false;
+    }
+  });
+  const [isInActiveWindow, setIsInActiveWindow] = useState(false);
+  const [isSleeping, setIsSleeping] = useState(false);
+
+  const alwaysOnRef = useRef(isAlwaysOn);
+  const isSleepingRef = useRef(false);
+  const activeConversationUntilRef = useRef<number>(0);
+  const restartTimeoutRef = useRef<any>(null);
+  const activeWindowTimerRef = useRef<any>(null);
+  const startListeningRef = useRef<(() => void) | null>(null);
+  const stopListeningRef = useRef<(() => void) | null>(null);
+
+  const listenStateRef = useRef<ListenState>('idle');
+  const emotionRef = useRef<AssistantEmotion>('neutral');
+  const emotionIntensityRef = useRef<number>(1.0);
+  // Gesture, body posture and face effect refs — driven by LLM response
+  const gestureRef = useRef<GestureToken>('idle');
+  const bodyPostureRef = useRef<BodyToken>('neutral');
+  const faceFxRef = useRef<FaceEffectToken[]>([]);
+  const gestureTimeoutRef = useRef<any>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const isRecordingRef = useRef(false);
+  const dragRef = useRef({ isDragging: false, startX: 0, startY: 0, winStartX: 0, winStartY: 0, hasMoved: false });
+
+  // WebSocket streaming voice pipeline refs (reserved for real-time streaming)
+  // const voiceWsRef = useRef<WebSocket | null>(null);
+  // const audioChunkPlayerRef = useRef<AudioChunkPlayer | null>(null);
+  // const streamingTranscriptRef = useRef<string>('');
+
+  // Feedback state
+  const [lastReplyText, setLastReplyText] = useState<string | null>(null);
+  const [showFeedback, setShowFeedback] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+
+  // Speech gesture state: micro-nod accumulator
+  const nodPhaseRef = useRef(0);
+  const nodTargetRef = useRef(0);
+  const nodActiveRef = useRef(false);
+
+  // Mathematical Tracking State (Origin: WIN_W / 2, 180)
+  const cursorPosRef = useRef({
+    x: Math.round(WIN_W / 2),
+    y: 180,
+    smoothEyeX: 0,
+    smoothEyeY: 0,
+    smoothAngleX: 0,
+    smoothAngleY: 0,
+    smoothAngleZ: 0,
+    smoothBodyX: 0,
+  });
+
+  const emotionTimeoutRef = useRef<any>(null);
+  const lipSyncFrameRef = useRef<number | null>(null);
+  const lipSyncSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const lipSyncAnalyserRef = useRef<AnalyserNode | null>(null);
+  const mouthOpenRef = useRef(0);
+  const animTimeRef = useRef(0);
+  const lastFrameTimeRef = useRef(0);
+  const blinkTimerRef = useRef(3.0);
+  const currentAudioFilenameRef = useRef<string | null>(null);
+  const sendToBackendRef = useRef<((msg: string) => Promise<void> | void) | undefined>(undefined);
+
+  const updateEmotion = useCallback((newEmotion: AssistantEmotion, durationMs = 12000) => {
+    emotionRef.current = newEmotion;
+    if (emotionTimeoutRef.current) {
+      clearTimeout(emotionTimeoutRef.current);
+      emotionTimeoutRef.current = null;
+    }
+    if (newEmotion !== 'neutral' && durationMs > 0) {
+      emotionTimeoutRef.current = setTimeout(() => {
+        emotionRef.current = isSleepingRef.current ? 'sleeping' : 'neutral';
+      }, durationMs);
+    }
+  }, []);
+
+  // Update gesture + optionally auto-reset it after the reply finishes (called with 0 to persist)
+  const updateGesture = useCallback((
+    gesture: GestureToken,
+    body: BodyToken,
+    faceFx: FaceEffectToken[],
+    resetAfterMs = 0,
+  ) => {
+    gestureRef.current = gesture;
+    bodyPostureRef.current = body;
+    faceFxRef.current = faceFx;
+    if (gestureTimeoutRef.current) {
+      clearTimeout(gestureTimeoutRef.current);
+      gestureTimeoutRef.current = null;
+    }
+    if (resetAfterMs > 0) {
+      gestureTimeoutRef.current = setTimeout(() => {
+        gestureRef.current = 'idle';
+        bodyPostureRef.current = 'neutral';
+        faceFxRef.current = [];
+      }, resetAfterMs);
+    }
+  }, []);
+
+  const subtitleTimeoutRef = useRef<any>(null);
+
+  const showSubtitle = useCallback((text: string | null, autoDismissMs = 5000) => {
+    if (subtitleTimeoutRef.current) {
+      clearTimeout(subtitleTimeoutRef.current);
+      subtitleTimeoutRef.current = null;
+    }
+    setSubtitle(text);
+    if (text && autoDismissMs > 0) {
+      subtitleTimeoutRef.current = setTimeout(() => {
+        setSubtitle(null);
+        subtitleTimeoutRef.current = null;
+      }, autoDismissMs);
+    }
+  }, []);
+
+  // Sync Always-On state with ref and localStorage
+  useEffect(() => {
+    alwaysOnRef.current = isAlwaysOn;
+    try {
+      localStorage.setItem('sylphya_always_on', String(isAlwaysOn));
+    } catch { }
+  }, [isAlwaysOn]);
+
+  // Fetch backend config on mount
+  useEffect(() => {
+    fetch('http://localhost:8000/api/health')
+      .then(r => r.json())
+      .catch(() => {});
+  }, []);
+
+  // Refreshes the 25-second active conversational follow-up window
+  const refreshActiveConversationWindow = useCallback((durationMs = 25000) => {
+    activeConversationUntilRef.current = Date.now() + durationMs;
+    setIsInActiveWindow(true);
+    if (activeWindowTimerRef.current) clearTimeout(activeWindowTimerRef.current);
+    activeWindowTimerRef.current = setTimeout(() => {
+      setIsInActiveWindow(false);
+    }, durationMs);
+  }, []);
+
+  // Safely schedules next listening turn if Always-On mode is engaged
+  const scheduleRestartListening = useCallback((delay = 400) => {
+    if (!alwaysOnRef.current) return;
+    if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
+    restartTimeoutRef.current = setTimeout(() => {
+      if (
+        alwaysOnRef.current &&
+        listenStateRef.current === 'idle' &&
+        !isRecordingRef.current
+      ) {
+        startListeningRef.current?.();
+      }
+    }, delay);
+  }, []);
+
+  // Delete spoken audio file from backend after played or cancelled
+  const deleteSpokenAudioFile = useCallback((explicitFilename?: string | null) => {
+    const filename = explicitFilename || currentAudioFilenameRef.current;
+    if (filename) {
+      if (currentAudioFilenameRef.current === filename) {
+        currentAudioFilenameRef.current = null;
+      }
+      fetch(`http://localhost:8000/api/audio/${filename}`, { method: 'DELETE' }).catch(() => { });
+    }
+  }, []);
+
+  // Unified speech tear-down for lip sync, audio sources and mouth positions
+  const stopCurrentSpeech = useCallback(() => {
+    if (lipSyncFrameRef.current !== null) {
+      cancelAnimationFrame(lipSyncFrameRef.current);
+      lipSyncFrameRef.current = null;
+    }
+    if (lipSyncSourceRef.current) {
+      try { lipSyncSourceRef.current.stop(); } catch { }
+      try { lipSyncSourceRef.current.disconnect(); } catch { }
+      lipSyncSourceRef.current = null;
+    }
+    if (lipSyncAnalyserRef.current) {
+      try { lipSyncAnalyserRef.current.disconnect(); } catch { }
+      lipSyncAnalyserRef.current = null;
+    }
+    mouthOpenRef.current = 0;
+    if (modelRef.current?.internalModel?.coreModel) {
+      try {
+        modelRef.current.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', 0);
+      } catch { }
+    }
+    deleteSpokenAudioFile();
+  }, [deleteSpokenAudioFile]);
+
+  // Unified helper to reset listening state, emotion and restart Always-On
+  const setIdleState = useCallback((emotion: AssistantEmotion = 'neutral', restartDelayMs?: number, durationMs = 12000) => {
+    listenStateRef.current = 'idle';
+    setListenState('idle');
+    updateEmotion(isSleepingRef.current ? 'sleeping' : emotion, durationMs);
+    if (restartDelayMs !== undefined && alwaysOnRef.current) {
+      scheduleRestartListening(restartDelayMs);
+    }
+  }, [scheduleRestartListening, updateEmotion]);
+
+  // Unified wake-up transition from sleep mode
+  const wakeUpFromSleep = useCallback(async (customSubtitle?: string, promptToSend?: string) => {
+    isSleepingRef.current = false;
+    setIsSleeping(false);
+    updateEmotion('happy', 15000);
+    if (customSubtitle) {
+      showSubtitle(customSubtitle, 4000);
+    }
+    if (promptToSend) {
+      await sendToBackendRef.current?.(promptToSend);
+    } else if (alwaysOnRef.current && listenStateRef.current === 'idle' && !isRecordingRef.current) {
+      scheduleRestartListening(300);
+    }
+  }, [scheduleRestartListening, showSubtitle, updateEmotion]);
+
+  // Unified sleep transition
+  const enterSleepMode = useCallback(async (promptMsg?: string) => {
+    console.log('[Sleep Mode] Entering sleep mode');
+    isSleepingRef.current = true;
+    setIsSleeping(true);
+    activeConversationUntilRef.current = 0;
+    setIsInActiveWindow(false);
+    updateEmotion('sleeping', 0);
+    showSubtitle('💤 Sleeping: Say "Hey Sylphya" or tap to wake me', 6000);
+    if (promptMsg) {
+      await sendToBackendRef.current?.(promptMsg);
+    }
+  }, [showSubtitle, updateEmotion]);
+
+  // --- Pixel-Perfect Alpha Hit Testing & Seamless Click-Through ---
+  const isIgnoringRef = useRef(false);
+  const hitPixelBuffer = useRef(new Uint8Array(4));
+
+  const checkHit = useCallback((x: number, y: number): boolean => {
+    if (x < 0 || x >= WIN_W || y < 0 || y >= WIN_H) {
+      return false;
+    }
+
+    try {
+      const elem = document.elementFromPoint(x, y);
+      if (elem) {
+        if (
+          elem.tagName === 'BUTTON' ||
+          elem.closest('button') ||
+          elem.closest('.interactive') ||
+          elem.closest('.error-container')
+        ) {
+          return true;
+        }
+      }
+    } catch { }
+
+    const app = appRef.current;
+    if (!app || !app.view) return false;
+
+    const gl = (app.renderer as any)?.gl || (app.view as HTMLCanvasElement)?.getContext('webgl2') || (app.view as HTMLCanvasElement)?.getContext('webgl');
+    if (!gl) return false;
+
+    try {
+      const bufW = gl.drawingBufferWidth || WIN_W;
+      const bufH = gl.drawingBufferHeight || WIN_H;
+      const scaleX = bufW / WIN_W;
+      const scaleY = bufH / WIN_H;
+
+      const glX = Math.floor(x * scaleX);
+      const glY = Math.floor((WIN_H - 1 - y) * scaleY);
+
+      if (glX < 0 || glX >= bufW || glY < 0 || glY >= bufH) {
+        return false;
+      }
+
+      gl.readPixels(glX, glY, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, hitPixelBuffer.current);
+      return hitPixelBuffer.current[3] > 20;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const updateHitTest = useCallback((x: number, y: number) => {
+    if (dragRef.current.isDragging) {
+      if (isIgnoringRef.current) {
+        isIgnoringRef.current = false;
+        const ipc = getElectronIpc();
+        ipc?.send('set-ignore-mouse-events', false);
+      }
+      return;
+    }
+
+    const isHit = checkHit(x, y);
+    const shouldIgnore = !isHit;
+
+    if (canvasRef.current) {
+      canvasRef.current.style.cursor = isHit ? 'grab' : 'default';
+    }
+
+    if (shouldIgnore !== isIgnoringRef.current) {
+      isIgnoringRef.current = shouldIgnore;
+      const ipc = getElectronIpc();
+      if (ipc) {
+        if (shouldIgnore) {
+          ipc.send('set-ignore-mouse-events', true, { forward: true });
+        } else {
+          ipc.send('set-ignore-mouse-events', false);
+        }
+      }
+    }
+  }, [checkHit]);
+
+  // --- Live2D Setup & Procedural Animation Loop ---
+  const initLive2D = useCallback(async () => {
+    if (!canvasRef.current) return;
+    const char = JIAN_CHARACTER;
+
+    setState('loading');
+    setErrorMsg('');
+
+    try {
+      if (appRef.current) {
+        try {
+          appRef.current.destroy(true, { children: true });
+        } catch { }
+        appRef.current = null;
+      }
+
+      const app = new PIXI.Application({
+        width: WIN_W,
+        height: WIN_H,
+        backgroundAlpha: 0,
+        antialias: true,
+        resolution: window.devicePixelRatio || 2,
+        autoDensity: true,
+        preserveDrawingBuffer: true,
+        sharedTicker: true,
+      });
+
+      PIXI.Ticker.shared.start();
+
+      canvasRef.current.innerHTML = '';
+      canvasRef.current.appendChild(app.view as unknown as HTMLElement);
+      appRef.current = app;
+
+      const model = await Live2DModel.from(char.modelPath, {
+        autoInteract: false,
+        autoUpdate: true,
+      } as any);
+
+      if (!canvasRef.current || !appRef.current) {
+        model.destroy();
+        return;
+      }
+
+      modelRef.current = model;
+
+      const baseWidth = (model as any).internalModel.width || model.width;
+      const baseHeight = (model as any).internalModel.height || model.height;
+      const scale = Math.min(WIN_W / baseWidth, WIN_H / baseHeight) * char.scaleMultiplier;
+
+      model.scale.set(scale);
+      model.anchor.set(0.5, 0.5);
+      model.x = WIN_W / 2 + char.offsetX;
+      model.y = WIN_H / 2 + char.offsetY;
+      model.interactive = true;
+      app.stage.addChild(model);
+
+      model.on('hit', (hitAreas: string[]) => {
+        if (hitAreas.includes('Body') || hitAreas.includes('HitArea') || hitAreas.includes('Head')) {
+          if (listenStateRef.current === 'idle') {
+            sendToBackendRef.current?.(char.pokeMessage);
+          }
+        }
+      });
+
+      // Animation State Caches
+      const currentParams: Record<string, number> = {};
+      const proceduralState: Record<string, number> = {};
+
+      const updateFace = () => {
+        if (!modelRef.current?.internalModel?.coreModel) return;
+
+        const now = performance.now();
+        const dt = Math.min((now - (lastFrameTimeRef.current || now)) / 1000, 0.05);
+        lastFrameTimeRef.current = now;
+        animTimeRef.current += dt;
+        const t = animTimeRef.current;
+
+        const activeEmotion = emotionRef.current || 'neutral';
+        const baseParams = char.emotionMap[activeEmotion] || char.emotionMap['neutral'];
+        const targetParams: Record<string, number> = { ...baseParams };
+
+        // Apply face effect overlays from LLM (additive on top of emotion base)
+        const activeFaceFx = faceFxRef.current;
+        for (const fxToken of activeFaceFx) {
+          const fxParams = FACE_FX_MAP[fxToken];
+          if (fxParams) {
+            for (const [k, v] of Object.entries(fxParams)) {
+              // Clamp-merge: take the stronger of emotion base or fx value
+              targetParams[k] = Math.min(1, Math.max(targetParams[k] ?? 0, v));
+            }
+          }
+        }
+
+        // Apply gesture params from LLM (overlay on top of emotion + face_fx)
+        const activeGesture = gestureRef.current || 'idle';
+        const gestureParams = GESTURE_MAP[activeGesture] || {};
+        for (const [k, v] of Object.entries(gestureParams)) {
+          targetParams[k] = v;
+        }
+
+        // Desktop / Cursor tracking with origin at (WIN_W / 2, 180)
+        const dx = cursorPosRef.current.x - (WIN_W / 2);
+        const dy = cursorPosRef.current.y - 180;
+
+        const targetEyeX = Math.tanh(dx / 120);
+        const targetEyeY = Math.tanh(-dy / 120);
+        const targetAngleX = Math.tanh(dx / 220) * 26;
+        const targetAngleY = Math.tanh(-dy / 220) * 18;
+        const targetAngleZ = Math.tanh(-dx / 280) * 8;
+        const targetBodyX = Math.tanh(dx / 320) * 5;
+
+        const kEye = 1 - Math.exp(-12 * dt);
+        const kHead = 1 - Math.exp(-7 * dt);
+        const c = cursorPosRef.current;
+        c.smoothEyeX += (targetEyeX - c.smoothEyeX) * kEye;
+        c.smoothEyeY += (targetEyeY - c.smoothEyeY) * kEye;
+        c.smoothAngleX += (targetAngleX - c.smoothAngleX) * kHead;
+        c.smoothAngleY += (targetAngleY - c.smoothAngleY) * kHead;
+        c.smoothAngleZ += (targetAngleZ - c.smoothAngleZ) * kHead;
+        c.smoothBodyX += (targetBodyX - c.smoothBodyX) * kHead;
+
+        const isSleep = activeEmotion === 'sleeping' || isSleepingRef.current;
+        const currState = listenStateRef.current;
+
+        // Natural Procedural Eye Blinking (blinks naturally every 2.5-5.5s)
+        blinkTimerRef.current -= dt;
+        let eyeBlinkMultiplier = 1.0;
+        if (blinkTimerRef.current <= 0) {
+          const blinkProgress = -blinkTimerRef.current / 0.16; // 160ms blink duration
+          if (blinkProgress < 1.0) {
+            eyeBlinkMultiplier = blinkProgress < 0.5 ? (1.0 - blinkProgress * 2.0) : ((blinkProgress - 0.5) * 2.0);
+          } else {
+            blinkTimerRef.current = 2.5 + Math.random() * 3.0; // Next blink in 2.5-5.5s
+            eyeBlinkMultiplier = 1.0;
+          }
+        }
+
+        if (isSleep) {
+          targetParams.ParamEyeLOpen = 0;
+          targetParams.ParamEyeROpen = 0;
+          targetParams.ParamEyeBallX = 0;
+          targetParams.ParamEyeBallY = 0;
+        } else {
+          if (targetParams.ParamEyeBallX === undefined) targetParams.ParamEyeBallX = c.smoothEyeX;
+          if (targetParams.ParamEyeBallY === undefined) targetParams.ParamEyeBallY = c.smoothEyeY;
+
+          // Apply natural eye blink when not in specific forced-eye states
+          if (currState !== 'listening') {
+            const baseL = targetParams.ParamEyeLOpen !== undefined ? targetParams.ParamEyeLOpen : 1.0;
+            const baseR = targetParams.ParamEyeROpen !== undefined ? targetParams.ParamEyeROpen : 1.0;
+            targetParams.ParamEyeLOpen = baseL * eyeBlinkMultiplier;
+            targetParams.ParamEyeROpen = baseR * eyeBlinkMultiplier;
+          }
+        }
+
+        // Organic micro-expressions during idle (preserve negative/serious emotions without forcing a smile)
+        if (currState === 'idle' && !isSleep) {
+          const cheerfulBreath = Math.sin(t * 1.8) * 0.08;
+          const isCheerfulIdle = activeEmotion === 'neutral' || activeEmotion === 'happy' || activeEmotion === 'loving' || activeEmotion === 'adoring' || activeEmotion === 'excited' || activeEmotion === 'playful' || activeEmotion === 'starstruck';
+          if (isCheerfulIdle) {
+            targetParams.ParamMouthForm = Math.min(1, Math.max(0.5, (targetParams.ParamMouthForm ?? 0.85) + cheerfulBreath));
+            targetParams.ParamEyeLSmile = Math.min(1, Math.max(0.3, (targetParams.ParamEyeLSmile ?? 0.65) + cheerfulBreath * 0.4));
+            targetParams.ParamEyeRSmile = Math.min(1, Math.max(0.3, (targetParams.ParamEyeRSmile ?? 0.65) + cheerfulBreath * 0.4));
+            targetParams.ParamSwitch2 = Math.min(1, Math.max(0.2, (targetParams.ParamSwitch2 ?? 0.35) + Math.sin(t * 1.2) * 0.06));
+            targetParams.Ear_smile = Math.min(1, Math.max(0.1, (targetParams.Ear_smile ?? 0.25) + Math.sin(t * 1.0) * 0.12));
+          } else {
+            targetParams.Ear_smile = Math.min(1, Math.max(-1, (targetParams.Ear_smile ?? 0) + Math.sin(t * 1.0) * 0.06));
+          }
+        }
+
+        if (char.switchIds) {
+          for (const sw of char.switchIds) {
+            if (targetParams[sw] === undefined) targetParams[sw] = 0;
+          }
+        }
+
+        const coreModel = modelRef.current.internalModel.coreModel;
+
+        // 1. Emotion & Parameter Blending with intensity scaling and smooth lerp
+        const intensity = emotionIntensityRef.current ?? 1.0;
+        const lerpSpeed = 0.08 + intensity * 0.14;
+        for (const [param, rawTarget] of Object.entries(targetParams)) {
+          const isEmotionParam = param.startsWith('Param') && !param.startsWith('ParamAngle') && !param.startsWith('ParamBody') && !param.startsWith('ParamChest') && !param.startsWith('ParamHip') && !param.startsWith('ParamShoulder') && !param.startsWith('ParamBreath') && !param.startsWith('ParamMouthOpenY');
+          const neutralVal = char.emotionMap['neutral'][param] ?? 0;
+          const scaledTarget = isEmotionParam ? neutralVal + (rawTarget - neutralVal) * intensity : rawTarget;
+          if (currentParams[param] === undefined) currentParams[param] = scaledTarget;
+          currentParams[param] += (scaledTarget - currentParams[param]) * lerpSpeed;
+          coreModel.setParameterValueById(param, currentParams[param]);
+        }
+
+        if (currState !== 'speaking') {
+          mouthOpenRef.current = 0;
+          coreModel.setParameterValueById('ParamMouthOpenY', 0);
+        }
+
+        // 2. Continuous Organic Breathing
+        const breathSpeed = isSleep ? 1.0 : currState === 'speaking' ? 3.0 : currState === 'listening' ? 2.4 : 1.8;
+        const breathAmp = isSleep ? 0.3 : currState === 'speaking' ? 0.65 : 0.45;
+        const breath = Math.sin(t * breathSpeed) * breathAmp + breathAmp * 0.55;
+        coreModel.setParameterValueById('ParamBreath', Math.max(0, Math.min(1.0, breath)));
+
+        // 3. State-Specific Procedural Motions
+        const applySmoothed = (id: string, target: number, speed = 0.1) => {
+          if (proceduralState[id] === undefined) proceduralState[id] = 0;
+          proceduralState[id] += (target - proceduralState[id]) * speed;
+          coreModel.setParameterValueById(id, proceduralState[id]);
+        };
+
+        const mouthEnergy = mouthOpenRef.current;
+        let pBodyAngleX = 0;
+        let pBodyAngleZ = 0;
+        let pAngleX = 0;
+        let pAngleY = 0;
+        let pAngleZ = 0;
+        let pShoulder = 0;
+
+        if (isSleep) {
+          pAngleX = 2 + Math.sin(t * 0.8) * 2.0;
+          pAngleY = -6 + Math.cos(t * 0.6) * 1.5;
+          pAngleZ = -3 + Math.sin(t * 0.5) * 1.5;
+          pBodyAngleX = 1.0 + Math.sin(t * 0.7) * 0.5;
+          pBodyAngleZ = -2.0;
+          pShoulder = -0.15;
+          coreModel.setParameterValueById('ParamEyeLOpen', 0);
+          coreModel.setParameterValueById('ParamEyeROpen', 0);
+        } else if (currState === 'speaking') {
+          const nodOffset = nodActiveRef.current ? nodTargetRef.current * Math.sin(nodPhaseRef.current * Math.PI) : 0;
+          nodPhaseRef.current = Math.min(1, nodPhaseRef.current + dt * 4);
+          if (!nodActiveRef.current) nodPhaseRef.current = 0;
+
+          const intensityScale = 0.8 + (emotionIntensityRef.current ?? 1.0) * 0.5;
+
+          // ── Emotion-aware speaking body motion ───────────────────────────
+          if (activeEmotion === 'excited' || activeEmotion === 'starstruck' || activeEmotion === 'overwhelmed') {
+            // Fast bouncy, big arm energy, high amplitude
+            pBodyAngleX = (Math.sin(t * 2.8) * 6.0 + Math.sin(t * 3.5) * 2.5 + c.smoothBodyX * 0.6) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 2.2) * 5.0 * intensityScale;
+            pAngleX = (Math.sin(t * 2.4) * 6.0 + c.smoothAngleX * 0.6) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 2.8) * 6.0 + mouthEnergy * -5.0 + c.smoothAngleY * 0.6) * intensityScale;
+            pAngleZ = (Math.sin(t * 2.0 + 0.5) * 5.5 + c.smoothAngleZ * 0.6) * intensityScale;
+            pShoulder = mouthEnergy * 0.7 + Math.sin(t * 3.5) * 0.35;
+          } else if (activeEmotion === 'playful' || activeEmotion === 'smug') {
+            // Exaggerated hip sway, cheeky bounce, loose
+            pBodyAngleX = (Math.sin(t * 1.6) * 5.0 + Math.sin(t * 3.2) * 2.0 + c.smoothBodyX * 0.7) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 1.4 + 1) * 5.5 * intensityScale;
+            pAngleX = (Math.sin(t * 1.8) * 5.0 + c.smoothAngleX * 0.7) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 2.0) * 5.5 + mouthEnergy * -4.0 + c.smoothAngleY * 0.7) * intensityScale;
+            pAngleZ = (Math.sin(t * 1.5 + 0.5) * 5.0 + c.smoothAngleZ * 0.7) * intensityScale;
+            pShoulder = mouthEnergy * 0.4 + Math.sin(t * 2.8) * 0.3;
+          } else if (activeEmotion === 'concerned' || activeEmotion === 'sad') {
+            // Slow, hunched, tight, inward
+            pBodyAngleX = (Math.sin(t * 0.9) * 2.5 + c.smoothBodyX * 0.4) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 0.7 + 1) * 2.0 * intensityScale;
+            pAngleX = (Math.sin(t * 1.0) * 2.5 + c.smoothAngleX * 0.5) * intensityScale + nodOffset * 0.5;
+            pAngleY = (Math.sin(t * 1.1) * 2.5 + mouthEnergy * -2.0 + c.smoothAngleY * 0.5) * intensityScale;
+            pAngleZ = (Math.sin(t * 0.8 + 0.5) * 2.5 + c.smoothAngleZ * 0.5) * intensityScale;
+            pShoulder = mouthEnergy * 0.2 + Math.sin(t * 1.5) * 0.1;
+          } else if (activeEmotion === 'angry' || activeEmotion === 'annoyed' || activeEmotion === 'tsundere') {
+            // Stiff, sharp snapping motions, forward lean
+            pBodyAngleX = (Math.sin(t * 2.0) * 4.0 + c.smoothBodyX * 0.5) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 1.8 + 1) * 2.5 * intensityScale;
+            pAngleX = (Math.sin(t * 2.2) * 4.5 + c.smoothAngleX * 0.5) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 2.0) * 4.0 + mouthEnergy * -3.0 + c.smoothAngleY * 0.5) * intensityScale;
+            pAngleZ = (Math.sin(t * 1.8 + 0.5) * 3.0 + c.smoothAngleZ * 0.5) * intensityScale;
+            pShoulder = mouthEnergy * 0.4 + Math.sin(t * 2.5) * 0.2;
+          } else if (activeEmotion === 'scared') {
+            // Trembling small motions, pulling back
+            const tremble = Math.sin(t * 14) * 0.3 * intensityScale;
+            pBodyAngleX = (Math.sin(t * 2.5) * 2.0 + tremble + c.smoothBodyX * 0.3) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 2.2 + 1) * 2.5 * intensityScale + tremble;
+            pAngleX = (-4 + Math.sin(t * 2.5) * 2.5 + tremble + c.smoothAngleX * 0.4) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 2.2) * 3.0 + mouthEnergy * -3.0 + c.smoothAngleY * 0.4) * intensityScale;
+            pAngleZ = (Math.sin(t * 2.0 + 0.5) * 2.5 + tremble + c.smoothAngleZ * 0.4) * intensityScale;
+            pShoulder = mouthEnergy * 0.3 + tremble * 0.5;
+          } else if (activeEmotion === 'loving' || activeEmotion === 'adoring') {
+            // Gentle dreamy sway, soft and slow
+            pBodyAngleX = (Math.sin(t * 0.8) * 2.5 + Math.sin(t * 1.4) * 1.0 + c.smoothBodyX * 0.5) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 0.7 + 1) * 2.5 * intensityScale;
+            pAngleX = (Math.sin(t * 1.0) * 3.0 + c.smoothAngleX * 0.6) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 1.2) * 3.5 + mouthEnergy * -2.5 + c.smoothAngleY * 0.6) * intensityScale;
+            pAngleZ = (Math.sin(t * 0.9 + 0.5) * 3.0 + c.smoothAngleZ * 0.6) * intensityScale;
+            pShoulder = mouthEnergy * 0.3 + Math.sin(t * 1.4) * 0.15;
+          } else if (activeEmotion === 'bored') {
+            // Minimal motion, sluggish
+            pBodyAngleX = (Math.sin(t * 0.5) * 1.5 + c.smoothBodyX * 0.3) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 0.4 + 1) * 1.2 * intensityScale;
+            pAngleX = (Math.sin(t * 0.6) * 2.0 + c.smoothAngleX * 0.4) * intensityScale + nodOffset * 0.3;
+            pAngleY = (Math.sin(t * 0.5) * 2.0 + mouthEnergy * -1.5 + c.smoothAngleY * 0.4) * intensityScale;
+            pAngleZ = (Math.sin(t * 0.4 + 0.5) * 1.5 + c.smoothAngleZ * 0.4) * intensityScale;
+            pShoulder = mouthEnergy * 0.1 + Math.sin(t * 0.9) * 0.08;
+          } else {
+            // Default speaking motion (happy, neutral, thinking, surprised, curious, embarrassed)
+            pBodyAngleX = (Math.sin(t * 1.2) * 4.0 + Math.sin(t * 2.1) * 2.0 + c.smoothBodyX * 0.6) * intensityScale;
+            pBodyAngleZ = Math.sin(t * 1.0 + 1) * 3.0 * intensityScale;
+            pAngleX = (Math.sin(t * 1.6) * 4.5 + c.smoothAngleX * 0.7) * intensityScale + nodOffset;
+            pAngleY = (Math.sin(t * 1.8) * 5.0 + mouthEnergy * -4.0 + c.smoothAngleY * 0.7) * intensityScale;
+            pAngleZ = (Math.sin(t * 1.3 + 0.5) * 4.5 + c.smoothAngleZ * 0.7) * intensityScale;
+            pShoulder = mouthEnergy * 0.5 + Math.sin(t * 2.5) * 0.25;
+          }
+
+          // ── Body posture token blends on top of speaking motion ──────────
+          const posture = BODY_MAP[bodyPostureRef.current] || BODY_MAP['neutral'];
+          const procedural = 1 - posture.rigidBlend;
+          const tremble = posture.trembleAmp > 0 ? Math.sin(t * 16) * posture.trembleAmp * intensityScale : 0;
+          pAngleX = pAngleX * procedural + posture.angleXBias * posture.rigidBlend + tremble;
+          pAngleY = pAngleY * procedural + posture.angleYBias * posture.rigidBlend;
+          pBodyAngleX = pBodyAngleX * procedural * posture.bodyXMul + tremble;
+          pBodyAngleZ = pBodyAngleZ * procedural * posture.bodyZMul + tremble * 0.5;
+
+        } else if (currState === 'listening') {
+          // Attentive listening posture: tilted head with curiosity
+          pAngleX = 10 + Math.sin(t * 1.2) * 2.5 + c.smoothAngleX * 0.7;
+          pAngleY = -6 + Math.sin(t * 1.5) * 2.0 + c.smoothAngleY * 0.7;
+          pAngleZ = 5 + Math.sin(t * 0.8) * 3.5 + c.smoothAngleZ * 0.7;
+          pBodyAngleX = c.smoothBodyX * 0.7;
+          pBodyAngleZ = 5 + Math.sin(t * 1.0) * 2.0;
+          pShoulder = 0.3 + Math.sin(t * 1.2) * 0.15;
+          coreModel.setParameterValueById('ParamEyeLOpen', 1.2);
+          coreModel.setParameterValueById('ParamEyeROpen', 1.2);
+        } else {
+          // Dynamic Idle Motion: organic sway, head movement, and breathing
+          // Apply body posture token to idle too
+          const posture = BODY_MAP[bodyPostureRef.current] || BODY_MAP['neutral'];
+          const procedural = 1 - posture.rigidBlend;
+          const tremble = posture.trembleAmp > 0 ? Math.sin(t * 16) * posture.trembleAmp : 0;
+
+          pBodyAngleX = (Math.sin(t * 1.2) * 3.0 * posture.bodyXMul + Math.sin(t * 0.7) * 1.8 + c.smoothBodyX + tremble) * procedural + posture.angleXBias * posture.rigidBlend;
+          pBodyAngleZ = (Math.sin(t * 0.9 + 1) * 2.2 * posture.bodyZMul + Math.tanh(-dx / 280) * 3 + tremble * 0.5) * procedural;
+          pAngleX = (Math.sin(t * 1.4) * 4.0 + Math.sin(t * 0.6) * 2.0 + c.smoothAngleX + tremble) * procedural + posture.angleXBias * posture.rigidBlend;
+          pAngleY = (Math.sin(t * 1.8) * 3.0 + Math.cos(t * 0.9) * 2.0 + c.smoothAngleY + posture.angleYBias) * procedural;
+          pAngleZ = (Math.sin(t * 1.1) * 3.5 + c.smoothAngleZ) * procedural;
+          pShoulder = Math.sin(t * 2) * 0.15;
+        }
+
+        // 4. Apply Procedural Rig Parameters
+        applySmoothed('ParamAngleX', pAngleX);
+        applySmoothed('ParamAngleY', pAngleY);
+        applySmoothed('ParamAngleZ', pAngleZ);
+        applySmoothed('ParamChestAngleX', pBodyAngleX * 0.8);
+        applySmoothed('ParamChestAngleY', (pAngleY * 0.3) + Math.sin(t * 2) * 0.3);
+        applySmoothed('ParamBodyAngleX0', pBodyAngleX * 1.2);
+        applySmoothed('ParamBodyAngleY0', pAngleY * 0.4);
+        applySmoothed('ParamBodyAngleZ0', pBodyAngleZ * 1.1);
+        applySmoothed('ParamHipAngleX0', pBodyAngleX * 0.6);
+        applySmoothed('ParamHipAngleZ0', pBodyAngleZ * 0.5);
+        applySmoothed('ParamBodyAngleRX', pBodyAngleX * 1.5);
+        applySmoothed('ParamBodyAngleRY', pShoulder * 2.0);
+        applySmoothed('ParamShoulderAngleX', pBodyAngleX * 0.4);
+        applySmoothed('ParamShoulderAngleY', pShoulder * 0.8);
+
+        // Cat Tail & Ears Physics
+        const tailBase = currState === 'speaking' ? Math.sin(t * 2.4) * 0.7 + mouthEnergy * 0.4
+          : currState === 'listening' ? Math.sin(t * 1.8) * 0.5
+            : Math.sin(t * 1.4) * 0.45 + (pBodyAngleX * 0.08);
+        applySmoothed('Param_Angle_Rotation_1_ArtMesh220', tailBase);
+
+        // Ear twitches: natural occasional rapid twitch
+        const earNoise = Math.sin(t * 0.5) > 0.85 ? Math.sin(t * 16) * 0.4 : 0;
+        const earTwitchL = (Math.sin(t * 2.2) * 0.18 + earNoise) * (currState === 'speaking' ? (0.6 + mouthEnergy) : 0.5);
+        const earTwitchR = (Math.sin(t * 2.2 + 1.2) * 0.18 + earNoise) * (currState === 'speaking' ? (0.6 + mouthEnergy) : 0.5);
+        applySmoothed('Ear_SR1', earTwitchR);
+        applySmoothed('Ear_SL1', earTwitchL);
+        if (currState === 'listening') applySmoothed('Ear_smile', 0.85);
+
+        if (modelRef.current) {
+          try { modelRef.current.focus(cursorPosRef.current.x, cursorPosRef.current.y); } catch { }
+        }
+      };
+
+      (model as any).internalModel.on('beforeModelUpdate', updateFace);
+      setState('ready');
+    } catch (err: any) {
+      console.error('Failed to initialize Live2D:', err);
+      setErrorMsg(err?.message || 'Unknown error loading the Live2D model.');
+      setState('error');
+    }
+  }, []);
+
+  useEffect(() => {
+    initLive2D();
+    return () => {
+      if (subtitleTimeoutRef.current) {
+        clearTimeout(subtitleTimeoutRef.current);
+        subtitleTimeoutRef.current = null;
+      }
+      stopCurrentSpeech();
+      if (appRef.current) {
+        try {
+          appRef.current.destroy(true, { children: true, texture: true, baseTexture: true });
+        } catch { }
+        appRef.current = null;
+        modelRef.current = null;
+      }
+    };
+  }, []);
+
+  // --- Feedback submission ---
+  const submitFeedback = useCallback(async (positive: boolean) => {
+    setShowFeedback(false);
+    try {
+      await fetch('http://localhost:8000/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: lastReplyText, positive }),
+      });
+    } catch { }
+  }, [lastReplyText]);
+
+  // --- Backend Chat, Edge-TTS Audio & Real-Time Lip Sync ---
+  const sendToBackend = async (message: string) => {
+    if (!message.trim()) return;
+
+    stopCurrentSpeech();
+    setShowFeedback(false);
+
+    const cleanMsg = message.trim().toLowerCase().replace(/[^\w\s]/g, '');
+    const isGreeting = GREETING_REGEX.test(cleanMsg);
+
+    listenStateRef.current = 'processing';
+    setListenState('processing');
+
+    if (isGreeting) {
+      showSubtitle('Hello!', 5000);
+      updateEmotion('happy', 15000);
+      updateGesture('wave_right', 'lean_forward', ['blush'], 8000);
+    } else {
+      updateEmotion('thinking', 0);
+      updateGesture('idle', 'neutral', [], 0);
+    }
+
+    let data: any = null;
+    try {
+      const response = await fetch('http://localhost:8000/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      });
+
+      if (!response.ok) throw new Error(`Backend error: ${response.status}`);
+      data = await response.json();
+
+      const emotion = (data.emotion || 'happy') as AssistantEmotion;
+      const intensity = typeof data.intensity === 'number' ? Math.max(0.1, Math.min(1.0, data.intensity)) : 1.0;
+      emotionIntensityRef.current = intensity;
+      updateEmotion(emotion, 15000);
+
+      // Apply LLM-driven gesture, body posture and face FX (auto-reset after 18s)
+      const gesture = (data.gesture || 'idle') as GestureToken;
+      const body = (data.body || 'neutral') as BodyToken;
+      const faceFx = Array.isArray(data.face_fx) ? data.face_fx as FaceEffectToken[] : [];
+      updateGesture(gesture, body, faceFx, 18000);
+
+      setLastReplyText(data.text || null);
+      setIsMuted(!!data.muted);
+
+      // Auto-muted while the user's music/video is playing (or TTS unavailable): show text + keep emotion/gesture briefly
+      if (data.muted || (!data.audio_base64 && !data.audio_url) || !modelRef.current) {
+        setIsMuted(!!data.muted);
+        showSubtitle(
+          data.muted
+            ? `🔇 ${data.text || (isGreeting ? 'Hello!' : '')}`
+            : data.text || (isGreeting ? 'Hello!' : null),
+          6000,
+        );
+        setIdleState(emotion, 600, 6000);
+        updateGesture(gesture, body, faceFx, 4000);
+        if (alwaysOnRef.current) {
+          refreshActiveConversationWindow(25000);
+        }
+        setShowFeedback(true);
+        return;
+      }
+
+      // Track filename to ensure it is deleted after being spoken or on interruption
+      const audioFilename = data.filename || (data.audio_url ? data.audio_url.split('/').pop()?.split('?')[0] : null);
+      currentAudioFilenameRef.current = audioFilename || null;
+
+      const arrayBuffer = data.audio_base64
+        ? base64ToArrayBuffer(data.audio_base64)
+        : await (await fetch(data.audio_url)).arrayBuffer();
+
+      const audioCtx = getAudioContext();
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      lipSyncSourceRef.current = source;
+
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.25;
+      source.connect(analyser);
+      analyser.connect(audioCtx.destination);
+      lipSyncAnalyserRef.current = analyser;
+
+      const timeData = new Uint8Array(analyser.fftSize);
+      let running = true;
+      let previousMouth = 0;
+      let lastTime = performance.now();
+      // Speech gesture: schedule micro-nods tied to sentences (every 2.5-4.5s)
+      let nextNodAt = audioCtx.currentTime + 1.5 + Math.random() * 2;
+
+      const updateLipSync = (now: number) => {
+        if (!running || !modelRef.current) return;
+        const coreModel = modelRef.current?.internalModel?.coreModel;
+        if (!coreModel) return;
+
+        const deltaTime = Math.min((now - lastTime) / 1000, 0.05);
+        lastTime = now;
+
+        analyser.getByteTimeDomainData(timeData);
+        let sum = 0;
+        for (let i = 0; i < timeData.length; i++) {
+          const s = (timeData[i] - 128) / 128;
+          sum += s * s;
+        }
+        const rms = Math.sqrt(sum / timeData.length);
+        const normalized = Math.min(1, Math.max(0, rms - 0.01) / 0.12);
+        let targetMouth = Math.pow(normalized, 0.75);
+        if (targetMouth < 0.06) targetMouth = 0;
+
+        const speed = targetMouth > previousMouth ? 24 : 12;
+        const smoothing = 1 - Math.exp(-speed * deltaTime);
+        const mouth = previousMouth + (targetMouth - previousMouth) * smoothing;
+        previousMouth = mouth;
+        mouthOpenRef.current = mouth;
+
+        // Schedule micro-nod gestures during speech
+        if (audioCtx.currentTime >= nextNodAt) {
+          nodActiveRef.current = true;
+          nodTargetRef.current = (Math.random() > 0.5 ? 1 : -1) * (6 + Math.random() * 6);
+          nextNodAt = audioCtx.currentTime + 2.0 + Math.random() * 2.5;
+          setTimeout(() => { nodActiveRef.current = false; nodTargetRef.current = 0; }, 500);
+        }
+
+        coreModel.setParameterValueById('ParamMouthOpenY', mouth);
+        lipSyncFrameRef.current = requestAnimationFrame(updateLipSync);
+      };
+
+      source.onended = () => {
+        running = false;
+        nodActiveRef.current = false;
+        nodTargetRef.current = 0;
+        const smoothlyCloseMouth = () => {
+          if (!modelRef.current?.internalModel?.coreModel) return;
+          mouthOpenRef.current *= 0.65;
+          modelRef.current.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpenRef.current);
+          if (mouthOpenRef.current > 0.01) {
+            requestAnimationFrame(smoothlyCloseMouth);
+          } else {
+            stopCurrentSpeech();
+          }
+        };
+        smoothlyCloseMouth();
+
+        // Keep expression lingering briefly after speech finishes, then fade smoothly to neutral/idle
+        setIdleState(emotion, 600, 4500);
+        updateGesture(gesture, body, faceFx, 2500);
+        showSubtitle(data.text || (isGreeting ? 'Hello!' : null), 5000);
+        setShowFeedback(true);
+
+        // Delete audio file after being spoken
+        const targetFilename = data.filename || (data.audio_url ? data.audio_url.split('/').pop()?.split('?')[0] : null);
+        deleteSpokenAudioFile(targetFilename);
+
+        if (alwaysOnRef.current) {
+          refreshActiveConversationWindow(25000);
+        }
+      };
+
+      listenStateRef.current = 'speaking';
+      setListenState('speaking');
+      source.start(0);
+      lipSyncFrameRef.current = requestAnimationFrame(updateLipSync);
+
+    } catch (err) {
+      console.error('[Chat/LipSync] Error:', err);
+      const targetFilename = data?.filename || (data?.audio_url ? data.audio_url.split('/').pop()?.split('?')[0] : null);
+      deleteSpokenAudioFile(targetFilename);
+      stopCurrentSpeech();
+      setIdleState(isGreeting ? 'happy' : 'concerned', 1000);
+      showSubtitle(isGreeting ? 'Hello!' : null, 4000);
+    }
+  };
+
+  sendToBackendRef.current = sendToBackend;
+
+  // --- Microphone Recording with Voice Activity Detection (VAD) & faster-whisper STT ---
+  const startListening = async () => {
+    if (isRecordingRef.current || listenStateRef.current === 'speaking') return;
+
+    // Record audio via MediaRecorder and transcribe via backend faster-whisper (/api/transcribe)
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      isRecordingRef.current = true;
+      listenStateRef.current = 'listening';
+      setListenState('listening');
+
+      // Use efficient opus compression at 32kbps mono for lowest transmission latency
+      const supportedMime = typeof MediaRecorder.isTypeSupported === 'function' && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: supportedMime,
+        audioBitsPerSecond: 32000,
+      });
+      mediaRecorderRef.current = mediaRecorder;
+      const audioChunks: Blob[] = [];
+
+      const audioContext = new AudioContext();
+      const analyser = audioContext.createAnalyser();
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+      analyser.fftSize = 512;
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+      let silentFrames = 0;
+      let speechFrames = 0;
+      let hasSpoken = false;
+      const SILENCE_THRESHOLD = 12;
+      // 7-8 frames * 80ms = ~560-640ms natural pause before cutting (cuts ~900ms off dead wait)
+      const SILENCE_FRAMES_TO_STOP = alwaysOnRef.current ? 7 : 8;
+
+      console.log(`[MIC] Started recording (Mode: ${alwaysOnRef.current ? 'Always-On' : 'Push-to-Talk'})`);
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunks.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        try { audioContext.close(); } catch { }
+        isRecordingRef.current = false;
+
+        const totalBytes = audioChunks.reduce((acc, c) => acc + c.size, 0);
+        console.log(`[MIC] Stopped. Chunks: ${audioChunks.length}, Total bytes: ${totalBytes}, Spoken frames: ${speechFrames}`);
+
+        // If manual push-to-talk was used or speech was detected, transcribe
+        const shouldTranscribe = audioChunks.length > 0 && (hasSpoken || !alwaysOnRef.current || totalBytes > 10000);
+
+        if (!shouldTranscribe) {
+          console.log('[MIC] Ignored: no speech activity detected.');
+          setIdleState('neutral', 200);
+          return;
+        }
+
+        listenStateRef.current = 'processing';
+        setListenState('processing');
+
+        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+
+        try {
+          const formData = new FormData();
+          formData.append('audio', audioBlob, 'recording.webm');
+
+          const res = await fetch('http://localhost:8000/api/transcribe', {
+            method: 'POST',
+            body: formData,
+          });
+
+          if (!res.ok) throw new Error(`Transcription failed with HTTP ${res.status}`);
+          const data = await res.json();
+          const text = data.text?.trim();
+
+          console.log('[MIC] Transcribed result:', text ? `"${text}"` : '<empty>');
+
+          if (text && text.length > 0) {
+            showSubtitle(text, 2500);
+            const now = Date.now();
+            const hasWakeWord = ANY_WAKE_WORD_PATTERN.test(text);
+            const isWakeCommand = WAKE_COMMAND_REGEX.test(text);
+
+            // 1. SLEEPING STATE
+            if (isSleepingRef.current) {
+              if (hasWakeWord || isWakeCommand) {
+                console.log('[Sleep Mode] Woken up by speech:', text);
+                const cleanedText = text
+                  .replace(WAKE_WORD_PATTERN, '')
+                  .replace(WAKE_WORD_CLEAN_PATTERN, '')
+                  .replace(WAKE_COMMAND_REGEX, '')
+                  .trim();
+
+                if (!cleanedText) {
+                  await wakeUpFromSleep(
+                    "I'm awake, Sir! What can I do for you?",
+                    "The user just woke you up. Give a short, cheerful, wakeful greeting."
+                  );
+                } else {
+                  await wakeUpFromSleep();
+                  refreshActiveConversationWindow(25000);
+                  await sendToBackend(cleanedText);
+                }
+              } else {
+                console.log('[Sleep Mode] Ignored speech while sleeping:', text);
+                setIdleState('sleeping', 300);
+              }
+              return;
+            }
+
+            // 2. AWAKE STATE - Check for Sleep Command
+            if (SLEEP_COMMAND_REGEX.test(text)) {
+              await enterSleepMode("The user told you to go to sleep or take a rest. Reply softly, charmingly, and say goodnight (1 short sentence).");
+              return;
+            }
+
+            const inActiveWindow = activeConversationUntilRef.current > now;
+
+            if (!alwaysOnRef.current || inActiveWindow || hasWakeWord) {
+              let cleanedText = text;
+              if (hasWakeWord) {
+                cleanedText = text.replace(WAKE_WORD_PATTERN, '').replace(WAKE_WORD_CLEAN_PATTERN, '').trim();
+                if (!cleanedText) cleanedText = 'Hey Sylphya';
+              }
+              refreshActiveConversationWindow(25000);
+              await sendToBackend(cleanedText);
+            } else {
+              console.log('[Always-On] Background speech ignored (no wake word match):', text);
+              setIdleState('neutral', 300);
+            }
+          } else {
+            console.log('[MIC] No words recognized from audio.');
+            setIdleState('neutral', 300);
+          }
+        } catch (err) {
+          console.error('[MIC] Transcription error:', err);
+          setIdleState('neutral', 500);
+        }
+      };
+
+      mediaRecorder.start(100);
+
+      const vadInterval = setInterval(() => {
+        analyser.getByteFrequencyData(dataArray);
+        const volume = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+
+        if (volume > SILENCE_THRESHOLD) {
+          hasSpoken = true;
+          speechFrames++;
+          silentFrames = 0;
+        } else if (hasSpoken && speechFrames >= 4) {
+          // Only count silence after ~320ms of active speech has been captured
+          silentFrames++;
+          if (silentFrames >= SILENCE_FRAMES_TO_STOP) {
+            clearInterval(vadInterval);
+            if (mediaRecorder.state === 'recording') mediaRecorder.stop();
+          }
+        }
+      }, 80);
+
+      setTimeout(() => {
+        clearInterval(vadInterval);
+        if (mediaRecorder.state === 'recording') mediaRecorder.stop();
+      }, 15000);
+
+    } catch (err) {
+      console.error('Microphone error:', err);
+      isRecordingRef.current = false;
+      setIdleState('neutral', 1000);
+    }
+  };
+
+  startListeningRef.current = startListening;
+
+  const stopListening = useCallback(() => {
+    if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+  }, []);
+
+  stopListeningRef.current = stopListening;
+
+  const toggleAlwaysOn = useCallback(() => {
+    if (isSleepingRef.current) {
+      wakeUpFromSleep("I'm awake, Sir! Say 'Hey Sylphya' anytime.");
+      return;
+    }
+
+    setIsAlwaysOn(prev => {
+      const nextVal = !prev;
+      alwaysOnRef.current = nextVal;
+      try {
+        localStorage.setItem('sylphya_always_on', String(nextVal));
+      } catch { }
+
+      if (nextVal) {
+        showSubtitle('Always-On active: Say "Hey Sylphya" anytime!', 4000);
+        if (listenStateRef.current === 'idle' && !isRecordingRef.current) {
+          scheduleRestartListening(300);
+        }
+      } else {
+        showSubtitle('Push-to-Talk active (Ctrl+Space to talk)', 3000);
+        if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
+        if (listenStateRef.current === 'listening') {
+          stopListening();
+        }
+      }
+      return nextVal;
+    });
+  }, [scheduleRestartListening, showSubtitle, stopListening, wakeUpFromSleep]);
+
+  // Auto-engage Always-On listener once Live2D is initialized
+  useEffect(() => {
+    if (state === 'ready' && alwaysOnRef.current && listenStateRef.current === 'idle') {
+      scheduleRestartListening(1200);
+    }
+  }, [state, scheduleRestartListening]);
+
+  // --- Desktop Cursor Tracking ---
+  useEffect(() => {
+    let cleanupIpc: (() => void) | undefined;
+    const ipc = getElectronIpc();
+
+    if (ipc && typeof ipc.on === 'function') {
+      const onGlobalCursor = (_event: any, relX: number, relY: number) => {
+        cursorPosRef.current.x = relX;
+        cursorPosRef.current.y = relY;
+        updateHitTest(relX, relY);
+      };
+      ipc.on('cursor-pos', onGlobalCursor);
+      cleanupIpc = () => {
+        try { ipc.removeListener('cursor-pos', onGlobalCursor); } catch { }
+      };
+    }
+
+    const onMouseMove = (e: MouseEvent) => {
+      cursorPosRef.current.x = e.clientX;
+      cursorPosRef.current.y = e.clientY;
+      updateHitTest(e.clientX, e.clientY);
+    };
+    window.addEventListener('mousemove', onMouseMove, { passive: true });
+
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      cleanupIpc?.();
+      const ipc = getElectronIpc();
+      ipc?.send('set-ignore-mouse-events', false);
+    };
+  }, [updateHitTest]);
+
+  // --- Keyboard Shortcuts (Ctrl+Space to Talk, Ctrl+Shift+A for Always-On) ---
+  useEffect(() => {
+    const ipc = getElectronIpc();
+    let cleanupIpc: (() => void) | undefined;
+
+    if (ipc && typeof ipc.on === 'function') {
+      const handleHotkey = () => {
+        if (state === 'ready') {
+          if (listenStateRef.current === 'idle') {
+            startListening();
+          } else if (listenStateRef.current === 'listening') {
+            stopListening();
+          }
+        }
+      };
+      const handleHotkeyToggleAlwaysOn = () => {
+        toggleAlwaysOn();
+      };
+
+      ipc.on('hotkey-listen', handleHotkey);
+      ipc.on('hotkey-toggle-always-on', handleHotkeyToggleAlwaysOn);
+
+      cleanupIpc = () => {
+        try {
+          ipc.removeListener('hotkey-listen', handleHotkey);
+          ipc.removeListener('hotkey-toggle-always-on', handleHotkeyToggleAlwaysOn);
+        } catch { }
+      };
+    }
+
+    return () => {
+      cleanupIpc?.();
+    };
+  }, [state, toggleAlwaysOn]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'A' || e.key === 'a')) {
+        e.preventDefault();
+        toggleAlwaysOn();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [toggleAlwaysOn]);
+
+  // Status & Mode Styling Config
+  const toggleTheme = isSleeping
+    ? {
+      bg: 'rgba(99, 102, 241, 0.3)',
+      border: 'rgba(129, 140, 248, 0.6)',
+      dot: '#818cf8',
+      glow: 'rgba(99, 102, 241, 0.5)',
+      label: 'Sleeping (Tap mascot to wake)',
+    }
+    : isAlwaysOn
+      ? isInActiveWindow
+        ? {
+          bg: 'rgba(59, 130, 246, 0.3)',
+          border: 'rgba(96, 165, 250, 0.6)',
+          dot: '#60a5fa',
+          glow: 'rgba(59, 130, 246, 0.5)',
+          label: 'Active Chat Mode',
+        }
+        : {
+          bg: 'rgba(34, 197, 94, 0.25)',
+          border: 'rgba(74, 222, 128, 0.6)',
+          dot: '#22c55e',
+          glow: 'rgba(34, 197, 94, 0.5)',
+          label: 'Always-On (Say "Hey Sylphya")',
+        }
+      : {
+        bg: 'rgba(255, 255, 255, 0.08)',
+        border: 'rgba(255, 255, 255, 0.2)',
+        dot: '#9ca3af',
+        glow: 'rgba(255, 255, 255, 0.2)',
+        label: 'Push-to-Talk (Ctrl+Space or tap mascot)',
+      };
+
+  return (
+    <>
+      <div className={`loading-container ${state !== 'loading' ? 'hidden' : ''}`}>
+        <div className="loading-spinner" />
+      </div>
+
+      {state === 'error' && (
+        <div className="error-container" style={{ WebkitAppRegion: 'no-drag' } as any}>
+          <div className="error-icon">⚠️</div>
+          <div className="error-title">Failed to load model</div>
+          <div className="error-message">{errorMsg}</div>
+          <button className="error-retry" onClick={() => initLive2D()}>Retry</button>
+        </div>
+      )}
+
+      {/* Minimal Mode Indicator Dot (Zero text, bottom-left) */}
+      <div
+        className={`interactive always-on-toggle ${isAlwaysOn || isSleeping || listenState === 'listening' ? 'active' : ''}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          toggleAlwaysOn();
+        }}
+        title={`${toggleTheme.label} • Click to toggle Always-On / Wake Word mode (Ctrl+Shift+A)`}
+        style={{
+          position: 'absolute',
+          bottom: 12,
+          left: 12,
+          width: '14px',
+          height: '14px',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          borderRadius: '50%',
+          background: toggleTheme.bg,
+          border: `1px solid ${toggleTheme.border}`,
+          backdropFilter: 'blur(12px)',
+          WebkitBackdropFilter: 'blur(12px)',
+          cursor: 'pointer',
+          userSelect: 'none',
+          zIndex: 80,
+          boxShadow: `0 0 6px ${toggleTheme.glow}`,
+        }}
+      >
+        <span
+          style={{
+            width: '6px',
+            height: '6px',
+            borderRadius: '50%',
+            backgroundColor: listenState === 'listening' ? '#ef4444' : toggleTheme.dot,
+            boxShadow: `0 0 6px ${listenState === 'listening' ? '#ef4444' : toggleTheme.dot}`,
+            animation: !isSleeping && (isAlwaysOn || listenState === 'listening') ? 'pulse 1.2s infinite' : 'none',
+          }}
+        />
+      </div>
+
+      {/* Discreet Audio Status Indicators (Top-Right) */}
+      {listenState === 'listening' && (
+        <div style={{ position: 'absolute', top: 16, right: 16, color: '#ff4757', animation: 'pulse 1s infinite', fontSize: '20px', pointerEvents: 'none', zIndex: 50 }}>
+          🎤
+        </div>
+      )}
+      {listenState === 'processing' && (
+        <div style={{ position: 'absolute', top: 16, right: 16, color: '#ffa502', fontSize: '20px', pointerEvents: 'none', zIndex: 50 }}>
+          ⏳
+        </div>
+      )}
+
+      {/* Muted-while-media indicator */}
+      {isMuted && listenState !== 'listening' && listenState !== 'processing' && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 44,
+            right: 14,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '4px',
+            padding: '3px 9px',
+            borderRadius: '12px',
+            background: 'rgba(15, 15, 25, 0.75)',
+            border: '1px solid rgba(255,255,255,0.14)',
+            backdropFilter: 'blur(12px)',
+            WebkitBackdropFilter: 'blur(12px)',
+            color: 'rgba(255,255,255,0.75)',
+            fontSize: '10px',
+            letterSpacing: '0.3px',
+            pointerEvents: 'none',
+            zIndex: 50,
+          }}
+          title="Voice muted while music or video is playing"
+        >
+          🔇 muted
+        </div>
+      )}
+
+      {/* Main Transparent Canvas: Tap-to-Talk, Drag Window & Pixel-Accurate Click-Through */}
+      <div
+        className="canvas-wrapper"
+        ref={canvasRef}
+        onPointerDown={(e) => {
+          try {
+            (e.target as HTMLElement).setPointerCapture(e.pointerId);
+          } catch { }
+          let winPos = [0, 0];
+          try {
+            const ipc = getElectronIpc();
+            if (ipc?.sendSync) {
+              winPos = ipc.sendSync('get-window-pos') || [0, 0];
+            }
+          } catch { }
+
+          dragRef.current = {
+            isDragging: true,
+            startX: e.screenX,
+            startY: e.screenY,
+            winStartX: winPos[0],
+            winStartY: winPos[1],
+            hasMoved: false
+          };
+
+          if (canvasRef.current) {
+            canvasRef.current.style.cursor = 'grabbing';
+          }
+        }}
+        onPointerMove={(e) => {
+          cursorPosRef.current.x = e.clientX;
+          cursorPosRef.current.y = e.clientY;
+
+          if (dragRef.current.isDragging) {
+            const dx = e.screenX - dragRef.current.startX;
+            const dy = e.screenY - dragRef.current.startY;
+
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+              dragRef.current.hasMoved = true;
+            }
+
+            if (dragRef.current.hasMoved) {
+              try {
+                const ipc = getElectronIpc();
+                const newX = Math.round(Number(dragRef.current.winStartX || 0) + Number(dx || 0));
+                const newY = Math.round(Number(dragRef.current.winStartY || 0) + Number(dy || 0));
+                if (!isNaN(newX) && !isNaN(newY)) {
+                  ipc?.send('set-window-pos', newX, newY);
+                }
+              } catch { }
+            }
+          } else {
+            updateHitTest(e.clientX, e.clientY);
+          }
+        }}
+        onPointerUp={(e) => {
+          try {
+            (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+          } catch { }
+          dragRef.current.isDragging = false;
+
+          if (!dragRef.current.hasMoved && state === 'ready') {
+            try {
+              modelRef.current?.tap(e.clientX, e.clientY);
+            } catch { }
+
+            if (isSleepingRef.current) {
+              wakeUpFromSleep(
+                "I'm awake, Sir! What can I do for you?",
+                "The user tapped you to wake you up from sleep. Greet him with a short cheerful greeting."
+              );
+              return;
+            }
+
+            if (listenState === 'idle') {
+              startListening();
+            } else if (listenState === 'listening') {
+              stopListening();
+            }
+          }
+
+          updateHitTest(e.clientX, e.clientY);
+        }}
+      />
+
+      {/* Subtitle Bubble (Bottom) */}
+      {subtitle && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: showFeedback ? 68 : 24,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            maxWidth: '90%',
+            background: 'rgba(15, 15, 25, 0.85)',
+            backdropFilter: 'blur(20px)',
+            WebkitBackdropFilter: 'blur(20px)',
+            border: '1px solid rgba(255, 255, 255, 0.22)',
+            borderRadius: '16px',
+            padding: '8px 16px',
+            color: '#fff',
+            fontSize: '12px',
+            lineHeight: 1.4,
+            textAlign: 'center',
+            boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)',
+            pointerEvents: 'none',
+            zIndex: 60,
+            animation: 'fadeIn 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+            transition: 'bottom 0.3s ease',
+          }}
+        >
+          {subtitle}
+        </div>
+      )}
+
+      {/* Feedback Buttons (show after Sylphya speaks) */}
+      {showFeedback && listenState === 'idle' && (
+        <div
+          className="interactive"
+          style={{
+            position: 'absolute',
+            bottom: 18,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            gap: '10px',
+            alignItems: 'center',
+            background: 'rgba(15, 15, 25, 0.82)',
+            backdropFilter: 'blur(16px)',
+            WebkitBackdropFilter: 'blur(16px)',
+            border: '1px solid rgba(255,255,255,0.15)',
+            borderRadius: '20px',
+            padding: '5px 14px',
+            zIndex: 61,
+            animation: 'fadeIn 0.3s ease',
+          }}
+        >
+          <span style={{ color: 'rgba(255,255,255,0.45)', fontSize: '10px', letterSpacing: '0.3px' }}>Helpful?</span>
+          <button
+            onClick={() => submitFeedback(true)}
+            style={{
+              background: 'rgba(34,197,94,0.18)', border: '1px solid rgba(34,197,94,0.4)',
+              color: '#4ade80', borderRadius: '12px', padding: '3px 10px',
+              cursor: 'pointer', fontSize: '13px', transition: 'all 0.2s',
+            }}
+            title="Good response"
+          >👍</button>
+          <button
+            onClick={() => submitFeedback(false)}
+            style={{
+              background: 'rgba(239,68,68,0.18)', border: '1px solid rgba(239,68,68,0.4)',
+              color: '#f87171', borderRadius: '12px', padding: '3px 10px',
+              cursor: 'pointer', fontSize: '13px', transition: 'all 0.2s',
+            }}
+            title="Poor response"
+          >👎</button>
+          <button
+            onClick={() => setShowFeedback(false)}
+            style={{
+              background: 'transparent', border: 'none',
+              color: 'rgba(255,255,255,0.3)', cursor: 'pointer', fontSize: '11px', padding: '2px 4px',
+            }}
+          >✕</button>
+        </div>
+      )}
+    </>
+  );
+}
+
+export default App;

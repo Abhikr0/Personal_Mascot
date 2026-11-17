@@ -495,9 +495,12 @@ def get_local_whisper_model():
             model_size = os.getenv("LOCAL_WHISPER_MODEL", "base.en").strip()
             print(f"[STT:Local] Loading faster-whisper ({model_size}) on CPU...")
             t0 = time.time()
+            # Prefer Apple Silicon MPS, then CUDA, then CPU
+            _device = "auto"
+            _compute = "auto"
             try:
                 _local_whisper_model = WhisperModel(
-                    model_size, device="cpu", compute_type="int8",
+                    model_size, device=_device, compute_type=_compute,
                     download_root=whisper_dir, local_files_only=True
                 )
             except Exception:
@@ -510,7 +513,7 @@ def get_local_whisper_model():
                 socket.getaddrinfo = _ipv4_getaddrinfo
                 try:
                     _local_whisper_model = WhisperModel(
-                        model_size, device="cpu", compute_type="int8",
+                        model_size, device=_device, compute_type=_compute,
                         download_root=whisper_dir
                     )
                 finally:
@@ -740,7 +743,7 @@ async def chat_with_friday(req: ChatRequest):
             print(f"[FAST-PATH] Immediate greeting response for \"{message}\": \"{reply_text}\"")
         else:
             # Build messages for the agent with live clock + injected user profile/memory
-            sys_prompt = _build_system_prompt(message)
+            sys_prompt = await asyncio.to_thread(_build_system_prompt, message)
             agent_messages = [SystemMessage(content=sys_prompt)]
             
             # Compress old conversation history to keep context tight (every 20 turns)
@@ -1012,7 +1015,7 @@ async def voice_websocket(websocket: WebSocket):
                         asyncio.create_task(asyncio.to_thread(remember_user_statement, user_text))
                         asyncio.create_task(asyncio.to_thread(remember_relationships, user_text))
                         
-                        sys_prompt = _build_system_prompt(user_text)
+                        sys_prompt = await asyncio.to_thread(_build_system_prompt, user_text)
                         agent_messages = [SystemMessage(content=sys_prompt)] + chat_history[-10:] + [HumanMessage(content=user_text)]
                         
                         result = None

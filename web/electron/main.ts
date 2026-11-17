@@ -97,10 +97,15 @@ function createWindow() {
     mainWindow?.focus();
   });
 
-  // Forward renderer console logs to terminal
+  // Forward renderer console logs to terminal and debug log file
   mainWindow.webContents.on('console-message', (event: any) => {
     const msg = event?.message ?? event;
-    if (msg) console.log(`[UI]: ${msg}`);
+    if (msg) {
+      console.log(`[UI]: ${msg}`);
+      try {
+        fs.appendFileSync('/tmp/mascot_ui.log', `[UI]: ${msg}\n`);
+      } catch {}
+    }
   });
 }
 

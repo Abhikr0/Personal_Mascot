@@ -113,10 +113,9 @@ function App() {
   const isRecordingRef = useRef(false);
   const dragRef = useRef({ isDragging: false, startX: 0, startY: 0, winStartX: 0, winStartY: 0, hasMoved: false });
 
-  // WebSocket streaming voice pipeline refs (reserved for real-time streaming)
-  // const voiceWsRef = useRef<WebSocket | null>(null);
-  // const audioChunkPlayerRef = useRef<AudioChunkPlayer | null>(null);
-  // const streamingTranscriptRef = useRef<string>('');
+  // WebSocket streaming voice pipeline
+  const voiceWsRef = useRef<WebSocket | null>(null);
+  const wsPlayingRef = useRef(false);
 
   // Feedback state
   const [lastReplyText, setLastReplyText] = useState<string | null>(null);
@@ -804,8 +803,146 @@ function App() {
     } catch { }
   }, [lastReplyText]);
 
-  // --- Backend Chat, Edge-TTS Audio & Real-Time Lip Sync ---
+  // --- WebSocket helpers ---
+
+  /** Ensure we have a live WS connection; reuse if already open. */
+  const getVoiceWs = useCallback((): Promise<WebSocket> => {
+    return new Promise((resolve, reject) => {
+      const existing = voiceWsRef.current;
+      if (existing && existing.readyState === WebSocket.OPEN) {
+        resolve(existing);
+        return;
+      }
+      const ws = new WebSocket('ws://localhost:8000/ws/voice');
+      ws.binaryType = 'arraybuffer';
+      voiceWsRef.current = ws;
+      ws.onopen = () => resolve(ws);
+      ws.onerror = (e) => reject(e);
+      ws.onclose = () => { voiceWsRef.current = null; };
+    });
+  }, []);
+
+  /**
+   * Incrementally play streamed MP3 chunks from the WebSocket.
+   * Each binary frame from the server is a raw MP3 chunk. We collect
+   * them, then when `audio_end` arrives we decode and play the full buffer
+   * — this keeps the existing Web Audio API / lip-sync machinery intact while
+   * still cutting the HTTP round-trip from the pipeline.
+   */
+  const wsPlayChunks = useCallback(async (
+    chunks: Uint8Array[],
+    emotion: AssistantEmotion,
+    intensity: number,
+    gesture: GestureToken,
+    body: BodyToken,
+    faceFx: FaceEffectToken[],
+    replyText: string,
+    isGreeting: boolean,
+  ) => {
+    if (!chunks.length || !modelRef.current) {
+      emotionIntensityRef.current = intensity;
+      setIdleState(emotion, 600, 6000);
+      updateGesture(gesture, body, faceFx, 4000);
+      showSubtitle(replyText || null, 6000);
+      setShowFeedback(true);
+      if (alwaysOnRef.current) refreshActiveConversationWindow(25000);
+      return;
+    }
+
+    // Concatenate all MP3 chunks into one ArrayBuffer
+    const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+    const merged = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const c of chunks) { merged.set(c, offset); offset += c.byteLength; }
+
+    try {
+      const audioCtx = getAudioContext();
+      if (audioCtx.state === 'suspended') await audioCtx.resume();
+      const audioBuffer = await audioCtx.decodeAudioData(merged.buffer);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      lipSyncSourceRef.current = source;
+
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.25;
+      source.connect(analyser);
+      analyser.connect(audioCtx.destination);
+      lipSyncAnalyserRef.current = analyser;
+
+      const timeData = new Uint8Array(analyser.fftSize);
+      let running = true;
+      let previousMouth = 0;
+      let lastTime = performance.now();
+      let nextNodAt = audioCtx.currentTime + 1.5 + Math.random() * 2;
+
+      const updateLipSync = (now: number) => {
+        if (!running || !modelRef.current) return;
+        const coreModel = modelRef.current?.internalModel?.coreModel;
+        if (!coreModel) return;
+        const deltaTime = Math.min((now - lastTime) / 1000, 0.05);
+        lastTime = now;
+        analyser.getByteTimeDomainData(timeData);
+        let sum = 0;
+        for (let i = 0; i < timeData.length; i++) {
+          const s = (timeData[i] - 128) / 128;
+          sum += s * s;
+        }
+        const rms = Math.sqrt(sum / timeData.length);
+        const normalized = Math.min(1, Math.max(0, rms - 0.01) / 0.12);
+        let targetMouth = Math.pow(normalized, 0.75);
+        if (targetMouth < 0.06) targetMouth = 0;
+        const speed = targetMouth > previousMouth ? 24 : 12;
+        const smoothing = 1 - Math.exp(-speed * deltaTime);
+        const mouth = previousMouth + (targetMouth - previousMouth) * smoothing;
+        previousMouth = mouth;
+        mouthOpenRef.current = mouth;
+        if (audioCtx.currentTime >= nextNodAt) {
+          nodActiveRef.current = true;
+          nodTargetRef.current = (Math.random() > 0.5 ? 1 : -1) * (6 + Math.random() * 6);
+          nextNodAt = audioCtx.currentTime + 2.0 + Math.random() * 2.5;
+          setTimeout(() => { nodActiveRef.current = false; nodTargetRef.current = 0; }, 500);
+        }
+        coreModel.setParameterValueById('ParamMouthOpenY', mouth);
+        lipSyncFrameRef.current = requestAnimationFrame(updateLipSync);
+      };
+
+      source.onended = () => {
+        running = false;
+        nodActiveRef.current = false;
+        nodTargetRef.current = 0;
+        const smoothlyCloseMouth = () => {
+          if (!modelRef.current?.internalModel?.coreModel) return;
+          mouthOpenRef.current *= 0.65;
+          modelRef.current.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpenRef.current);
+          if (mouthOpenRef.current > 0.01) requestAnimationFrame(smoothlyCloseMouth);
+          else stopCurrentSpeech();
+        };
+        smoothlyCloseMouth();
+        setIdleState(emotion, 600, 4500);
+        updateGesture(gesture, body, faceFx, 2500);
+        showSubtitle(replyText || (isGreeting ? 'Hello!' : null), 5000);
+        setShowFeedback(true);
+        if (alwaysOnRef.current) refreshActiveConversationWindow(25000);
+      };
+
+      listenStateRef.current = 'speaking';
+      setListenState('speaking');
+      source.start(0);
+      lipSyncFrameRef.current = requestAnimationFrame(updateLipSync);
+    } catch (err) {
+      console.error('[WS-TTS] Audio decode error:', err);
+      stopCurrentSpeech();
+      setIdleState(isGreeting ? 'happy' : 'concerned', 1000);
+      showSubtitle(replyText || (isGreeting ? 'Hello!' : null), 5000);
+      setShowFeedback(true);
+    }
+  }, [getAudioContext, setIdleState, updateGesture, showSubtitle, stopCurrentSpeech, refreshActiveConversationWindow]);
+
+  // --- Backend Chat via WebSocket (single connection, no double HTTP round-trip) ---
   const sendToBackend = async (message: string) => {
+    console.log('[sendToBackend] Called with:', message);
     if (!message.trim()) return;
 
     stopCurrentSpeech();
@@ -826,159 +963,230 @@ function App() {
       updateGesture('idle', 'neutral', [], 0);
     }
 
-    let data: any = null;
+    // ── WebSocket path ────────────────────────────────────────────────────────
     try {
-      const response = await fetch('http://localhost:8000/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message }),
-      });
+      console.log('[sendToBackend] Connecting/getting WS...');
+      const ws = await getVoiceWs();
+      console.log('[sendToBackend] WS ready state:', ws.readyState);
 
-      if (!response.ok) throw new Error(`Backend error: ${response.status}`);
-      data = await response.json();
+      const audioChunks: Uint8Array[] = [];
+      let replyText = '';
+      let emotion: AssistantEmotion = 'happy';
+      let intensity = 1.0;
+      let gesture: GestureToken = 'idle';
+      let body: BodyToken = 'neutral';
+      let faceFx: FaceEffectToken[] = [];
 
-      const emotion = (data.emotion || 'happy') as AssistantEmotion;
-      const intensity = typeof data.intensity === 'number' ? Math.max(0.1, Math.min(1.0, data.intensity)) : 1.0;
-      emotionIntensityRef.current = intensity;
-      updateEmotion(emotion, 15000);
+      await new Promise<void>((resolve, reject) => {
+        const prevOnMsg = ws.onmessage;
+        const cleanup = () => { ws.onmessage = prevOnMsg; };
 
-      // Apply LLM-driven gesture, body posture and face FX (auto-reset after 18s)
-      const gesture = (data.gesture || 'idle') as GestureToken;
-      const body = (data.body || 'neutral') as BodyToken;
-      const faceFx = Array.isArray(data.face_fx) ? data.face_fx as FaceEffectToken[] : [];
-      updateGesture(gesture, body, faceFx, 18000);
+        ws.onmessage = async (event) => {
+          try {
+            if (event.data instanceof ArrayBuffer) {
+              audioChunks.push(new Uint8Array(event.data));
+              return;
+            }
 
-      setLastReplyText(data.text || null);
-      setIsMuted(!!data.muted);
+            const msg = JSON.parse(event.data as string);
+            console.log('[sendToBackend:WS] Received msg:', msg.type);
 
-      // Auto-muted while the user's music/video is playing (or TTS unavailable): show text + keep emotion/gesture briefly
-      if (data.muted || (!data.audio_base64 && !data.audio_url) || !modelRef.current) {
-        setIsMuted(!!data.muted);
-        showSubtitle(
-          data.muted
-            ? `🔇 ${data.text || (isGreeting ? 'Hello!' : '')}`
-            : data.text || (isGreeting ? 'Hello!' : null),
-          6000,
-        );
-        setIdleState(emotion, 600, 6000);
-        updateGesture(gesture, body, faceFx, 4000);
-        if (alwaysOnRef.current) {
-          refreshActiveConversationWindow(25000);
-        }
-        setShowFeedback(true);
-        return;
-      }
+            if (msg.type === 'emotion') {
+              updateEmotion(msg.emotion as AssistantEmotion, 0);
+              return;
+            }
 
-      // Track filename to ensure it is deleted after being spoken or on interruption
-      const audioFilename = data.filename || (data.audio_url ? data.audio_url.split('/').pop()?.split('?')[0] : null);
-      currentAudioFilenameRef.current = audioFilename || null;
+            if (msg.type === 'reply_meta') {
+              replyText = msg.text || '';
+              emotion = (msg.emotion || 'happy') as AssistantEmotion;
+              intensity = typeof msg.intensity === 'number'
+                ? Math.max(0.1, Math.min(1.0, msg.intensity))
+                : 1.0;
+              gesture = (msg.gesture || 'idle') as GestureToken;
+              body = (msg.body || 'neutral') as BodyToken;
+              faceFx = Array.isArray(msg.face_fx) ? msg.face_fx as FaceEffectToken[] : [];
 
-      const arrayBuffer = data.audio_base64
-        ? base64ToArrayBuffer(data.audio_base64)
-        : await (await fetch(data.audio_url)).arrayBuffer();
+              emotionIntensityRef.current = intensity;
+              updateEmotion(emotion, 15000);
+              updateGesture(gesture, body, faceFx, 18000);
+              setLastReplyText(replyText || null);
+              return;
+            }
 
-      const audioCtx = getAudioContext();
-      if (audioCtx.state === 'suspended') await audioCtx.resume();
-      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+            if (msg.type === 'audio_end') {
+              console.log('[sendToBackend:WS] Audio stream finished, chunks:', audioChunks.length, 'muted:', msg.muted);
+              cleanup();
+              if (msg.muted) {
+                setIsMuted(true);
+                showSubtitle(`🔇 ${replyText}`, 6000);
+                setIdleState(emotion, 600, 6000);
+                updateGesture(gesture, body, faceFx, 4000);
+                setShowFeedback(true);
+                if (alwaysOnRef.current) refreshActiveConversationWindow(25000);
+              } else {
+                setIsMuted(false);
+              }
+              resolve();
+              return;
+            }
 
-      const source = audioCtx.createBufferSource();
-      source.buffer = audioBuffer;
-      lipSyncSourceRef.current = source;
-
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 512;
-      analyser.smoothingTimeConstant = 0.25;
-      source.connect(analyser);
-      analyser.connect(audioCtx.destination);
-      lipSyncAnalyserRef.current = analyser;
-
-      const timeData = new Uint8Array(analyser.fftSize);
-      let running = true;
-      let previousMouth = 0;
-      let lastTime = performance.now();
-      // Speech gesture: schedule micro-nods tied to sentences (every 2.5-4.5s)
-      let nextNodAt = audioCtx.currentTime + 1.5 + Math.random() * 2;
-
-      const updateLipSync = (now: number) => {
-        if (!running || !modelRef.current) return;
-        const coreModel = modelRef.current?.internalModel?.coreModel;
-        if (!coreModel) return;
-
-        const deltaTime = Math.min((now - lastTime) / 1000, 0.05);
-        lastTime = now;
-
-        analyser.getByteTimeDomainData(timeData);
-        let sum = 0;
-        for (let i = 0; i < timeData.length; i++) {
-          const s = (timeData[i] - 128) / 128;
-          sum += s * s;
-        }
-        const rms = Math.sqrt(sum / timeData.length);
-        const normalized = Math.min(1, Math.max(0, rms - 0.01) / 0.12);
-        let targetMouth = Math.pow(normalized, 0.75);
-        if (targetMouth < 0.06) targetMouth = 0;
-
-        const speed = targetMouth > previousMouth ? 24 : 12;
-        const smoothing = 1 - Math.exp(-speed * deltaTime);
-        const mouth = previousMouth + (targetMouth - previousMouth) * smoothing;
-        previousMouth = mouth;
-        mouthOpenRef.current = mouth;
-
-        // Schedule micro-nod gestures during speech
-        if (audioCtx.currentTime >= nextNodAt) {
-          nodActiveRef.current = true;
-          nodTargetRef.current = (Math.random() > 0.5 ? 1 : -1) * (6 + Math.random() * 6);
-          nextNodAt = audioCtx.currentTime + 2.0 + Math.random() * 2.5;
-          setTimeout(() => { nodActiveRef.current = false; nodTargetRef.current = 0; }, 500);
-        }
-
-        coreModel.setParameterValueById('ParamMouthOpenY', mouth);
-        lipSyncFrameRef.current = requestAnimationFrame(updateLipSync);
-      };
-
-      source.onended = () => {
-        running = false;
-        nodActiveRef.current = false;
-        nodTargetRef.current = 0;
-        const smoothlyCloseMouth = () => {
-          if (!modelRef.current?.internalModel?.coreModel) return;
-          mouthOpenRef.current *= 0.65;
-          modelRef.current.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpenRef.current);
-          if (mouthOpenRef.current > 0.01) {
-            requestAnimationFrame(smoothlyCloseMouth);
-          } else {
-            stopCurrentSpeech();
+            if (msg.type === 'error') {
+              console.error('[sendToBackend:WS] Agent error:', msg.message);
+              cleanup();
+              reject(new Error(msg.message || 'WebSocket agent error'));
+              return;
+            }
+          } catch (parseErr) {
+            console.warn('[WS] Message parse error:', parseErr);
           }
         };
-        smoothlyCloseMouth();
 
-        // Keep expression lingering briefly after speech finishes, then fade smoothly to neutral/idle
-        setIdleState(emotion, 600, 4500);
-        updateGesture(gesture, body, faceFx, 2500);
-        showSubtitle(data.text || (isGreeting ? 'Hello!' : null), 5000);
-        setShowFeedback(true);
+        ws.onerror = (e) => { cleanup(); reject(e); };
 
-        // Delete audio file after being spoken
-        const targetFilename = data.filename || (data.audio_url ? data.audio_url.split('/').pop()?.split('?')[0] : null);
-        deleteSpokenAudioFile(targetFilename);
+        // Attach listener BEFORE sending chat message
+        console.log('[sendToBackend] Sending chat message over WS:', message);
+        ws.send(JSON.stringify({ action: 'chat', text: message }));
+      });
 
-        if (alwaysOnRef.current) {
-          refreshActiveConversationWindow(25000);
+      console.log('[sendToBackend] Playing chunks:', audioChunks.length);
+      // Play the collected audio chunks (non-muted path)
+      if (!wsPlayingRef.current) {
+        wsPlayingRef.current = true;
+        try {
+          await wsPlayChunks(audioChunks, emotion, intensity, gesture, body, faceFx, replyText, isGreeting);
+        } finally {
+          wsPlayingRef.current = false;
         }
-      };
+      }
 
-      listenStateRef.current = 'speaking';
-      setListenState('speaking');
-      source.start(0);
-      lipSyncFrameRef.current = requestAnimationFrame(updateLipSync);
+    } catch (wsErr) {
+      // ── HTTP fallback if WebSocket fails ─────────────────────────────────
+      console.warn('[WS] WebSocket failed, falling back to HTTP:', wsErr);
+      voiceWsRef.current = null;
 
-    } catch (err) {
-      console.error('[Chat/LipSync] Error:', err);
-      const targetFilename = data?.filename || (data?.audio_url ? data.audio_url.split('/').pop()?.split('?')[0] : null);
-      deleteSpokenAudioFile(targetFilename);
-      stopCurrentSpeech();
-      setIdleState(isGreeting ? 'happy' : 'concerned', 1000);
-      showSubtitle(isGreeting ? 'Hello!' : null, 4000);
+      let data: any = null;
+      try {
+        const response = await fetch('http://localhost:8000/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message }),
+        });
+        if (!response.ok) throw new Error(`Backend error: ${response.status}`);
+        data = await response.json();
+
+        const emotion = (data.emotion || 'happy') as AssistantEmotion;
+        const intensity = typeof data.intensity === 'number' ? Math.max(0.1, Math.min(1.0, data.intensity)) : 1.0;
+        emotionIntensityRef.current = intensity;
+        updateEmotion(emotion, 15000);
+        const gesture = (data.gesture || 'idle') as GestureToken;
+        const body = (data.body || 'neutral') as BodyToken;
+        const faceFx = Array.isArray(data.face_fx) ? data.face_fx as FaceEffectToken[] : [];
+        updateGesture(gesture, body, faceFx, 18000);
+        setLastReplyText(data.text || null);
+        setIsMuted(!!data.muted);
+
+        if (data.muted || (!data.audio_base64 && !data.audio_url) || !modelRef.current) {
+          showSubtitle(data.muted ? `🔇 ${data.text || ''}` : data.text || null, 6000);
+          setIdleState(emotion, 600, 6000);
+          updateGesture(gesture, body, faceFx, 4000);
+          if (alwaysOnRef.current) refreshActiveConversationWindow(25000);
+          setShowFeedback(true);
+          return;
+        }
+
+        const audioFilename = data.filename || (data.audio_url ? data.audio_url.split('/').pop()?.split('?')[0] : null);
+        currentAudioFilenameRef.current = audioFilename || null;
+
+        const arrayBuffer = data.audio_base64
+          ? base64ToArrayBuffer(data.audio_base64)
+          : await (await fetch(data.audio_url)).arrayBuffer();
+
+        const audioCtx = getAudioContext();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        lipSyncSourceRef.current = source;
+
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.25;
+        source.connect(analyser);
+        analyser.connect(audioCtx.destination);
+        lipSyncAnalyserRef.current = analyser;
+
+        const timeData = new Uint8Array(analyser.fftSize);
+        let running = true;
+        let previousMouth = 0;
+        let lastTime = performance.now();
+        let nextNodAt = audioCtx.currentTime + 1.5 + Math.random() * 2;
+
+        const updateLipSync = (now: number) => {
+          if (!running || !modelRef.current) return;
+          const coreModel = modelRef.current?.internalModel?.coreModel;
+          if (!coreModel) return;
+          const deltaTime = Math.min((now - lastTime) / 1000, 0.05);
+          lastTime = now;
+          analyser.getByteTimeDomainData(timeData);
+          let sum = 0;
+          for (let i = 0; i < timeData.length; i++) {
+            const s = (timeData[i] - 128) / 128;
+            sum += s * s;
+          }
+          const rms = Math.sqrt(sum / timeData.length);
+          const normalized = Math.min(1, Math.max(0, rms - 0.01) / 0.12);
+          let targetMouth = Math.pow(normalized, 0.75);
+          if (targetMouth < 0.06) targetMouth = 0;
+          const speed = targetMouth > previousMouth ? 24 : 12;
+          const smoothing = 1 - Math.exp(-speed * deltaTime);
+          const mouth = previousMouth + (targetMouth - previousMouth) * smoothing;
+          previousMouth = mouth;
+          mouthOpenRef.current = mouth;
+          if (audioCtx.currentTime >= nextNodAt) {
+            nodActiveRef.current = true;
+            nodTargetRef.current = (Math.random() > 0.5 ? 1 : -1) * (6 + Math.random() * 6);
+            nextNodAt = audioCtx.currentTime + 2.0 + Math.random() * 2.5;
+            setTimeout(() => { nodActiveRef.current = false; nodTargetRef.current = 0; }, 500);
+          }
+          coreModel.setParameterValueById('ParamMouthOpenY', mouth);
+          lipSyncFrameRef.current = requestAnimationFrame(updateLipSync);
+        };
+
+        source.onended = () => {
+          running = false;
+          nodActiveRef.current = false;
+          nodTargetRef.current = 0;
+          const smoothlyCloseMouth = () => {
+            if (!modelRef.current?.internalModel?.coreModel) return;
+            mouthOpenRef.current *= 0.65;
+            modelRef.current.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', mouthOpenRef.current);
+            if (mouthOpenRef.current > 0.01) requestAnimationFrame(smoothlyCloseMouth);
+            else stopCurrentSpeech();
+          };
+          smoothlyCloseMouth();
+          setIdleState(emotion, 600, 4500);
+          updateGesture(gesture, body, faceFx, 2500);
+          showSubtitle(data.text || (isGreeting ? 'Hello!' : null), 5000);
+          setShowFeedback(true);
+          const targetFilename = data.filename || (data.audio_url ? data.audio_url.split('/').pop()?.split('?')[0] : null);
+          deleteSpokenAudioFile(targetFilename);
+          if (alwaysOnRef.current) refreshActiveConversationWindow(25000);
+        };
+
+        listenStateRef.current = 'speaking';
+        setListenState('speaking');
+        source.start(0);
+        lipSyncFrameRef.current = requestAnimationFrame(updateLipSync);
+
+      } catch (httpErr) {
+        console.error('[HTTP Fallback] Error:', httpErr);
+        const targetFilename = data?.filename || (data?.audio_url ? data.audio_url.split('/').pop()?.split('?')[0] : null);
+        deleteSpokenAudioFile(targetFilename);
+        stopCurrentSpeech();
+        setIdleState(isGreeting ? 'happy' : 'concerned', 1000);
+        showSubtitle(isGreeting ? 'Hello!' : null, 4000);
+      }
     }
   };
 
@@ -1048,18 +1256,51 @@ function App() {
 
         const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
 
+        // ── WebSocket STT path: send audio → get transcript back ─────────────
+        let text = '';
         try {
-          const formData = new FormData();
-          formData.append('audio', audioBlob, 'recording.webm');
+          const ws = await getVoiceWs();
+          const audioArrayBuffer = await audioBlob.arrayBuffer();
 
-          const res = await fetch('http://localhost:8000/api/transcribe', {
-            method: 'POST',
-            body: formData,
+          // Send all audio as binary, then signal end-of-recording
+          ws.send(audioArrayBuffer);
+          ws.send(JSON.stringify({ action: 'transcribe' }));
+
+          text = await new Promise<string>((resolve, reject) => {
+            const prevOnMsg = ws.onmessage;
+            const cleanup = () => { ws.onmessage = prevOnMsg; };
+            ws.onmessage = (event) => {
+              try {
+                if (event.data instanceof ArrayBuffer) return; // ignore stray binary
+                const msg = JSON.parse(event.data as string);
+                if (msg.type === 'transcript') {
+                  cleanup();
+                  resolve(msg.text || '');
+                } else if (msg.type === 'error') {
+                  cleanup();
+                  reject(new Error(msg.message));
+                }
+              } catch { }
+            };
+            ws.onerror = (e) => { cleanup(); reject(e); };
           });
-
-          if (!res.ok) throw new Error(`Transcription failed with HTTP ${res.status}`);
-          const data = await res.json();
-          const text = data.text?.trim();
+        } catch (wsErr) {
+          // Fallback: HTTP transcribe
+          console.warn('[WS-STT] WebSocket STT failed, falling back to HTTP:', wsErr);
+          voiceWsRef.current = null;
+          try {
+            const formData = new FormData();
+            formData.append('audio', audioBlob, 'recording.webm');
+            const res = await fetch('http://localhost:8000/api/transcribe', { method: 'POST', body: formData });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            text = data.text?.trim() || '';
+          } catch (httpErr) {
+            console.error('[STT Fallback] HTTP also failed:', httpErr);
+            setIdleState('neutral', 500);
+            return;
+          }
+        }
 
           console.log('[MIC] Transcribed result:', text ? `"${text}"` : '<empty>');
 
@@ -1120,10 +1361,6 @@ function App() {
             console.log('[MIC] No words recognized from audio.');
             setIdleState('neutral', 300);
           }
-        } catch (err) {
-          console.error('[MIC] Transcription error:', err);
-          setIdleState('neutral', 500);
-        }
       };
 
       mediaRecorder.start(100);
